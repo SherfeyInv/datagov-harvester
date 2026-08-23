@@ -1,0 +1,63 @@
+name: E2E Tests
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  PY_VERSION: "3.12.13"
+  POETRY_VERSION: "latest"
+
+jobs:
+  test:
+    name: Playwright
+    environment: development
+    env:
+        CF_SERVICE_USER: ${{secrets.CF_SERVICE_USER}}
+        CF_SERVICE_AUTH: ${{secrets.CF_SERVICE_AUTH}}
+        HARVEST_RUNNER_APP_GUID: ${{secrets.HARVEST_RUNNER_APP_GUID}}
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 1
+    - name: Create local .env from sample
+      run: cp .env.sample .env
+    - name: Install node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version-file: "app/static/package.json"
+    - name: Build static assets
+      shell: bash
+      run: |
+        cd app/static
+        npm ci
+        npm run build
+    - name: Set up Python ${{ env.PY_VERSION }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ env.PY_VERSION }}
+    - name: Install Poetry ${{ env.POETRY_VERSION }}
+      uses: abatilo/actions-poetry@v4
+      with:
+        poetry-version: ${{ env.POETRY_VERSION }}
+        poetry-plugins: "poetry-plugin-export"
+    - name: Install Dependencies
+      run: |
+        poetry env use ${{ env.PY_VERSION }}
+        poetry install
+    - name: Install Playwright Browsers
+      run: poetry run playwright install --with-deps --only-shell chromium
+    - name: Run E2E tests
+      run: make test-e2e-ci
+    - uses: actions/upload-artifact@v7
+      if: ${{ !cancelled() }}
+      with:
+        name: e2e-report
+        path: e2e-report/
+        retention-days: 30

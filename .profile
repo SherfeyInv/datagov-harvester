@@ -8,29 +8,29 @@ function vcap_get_service () {
   name="$1"
   path="$2"
   service_name=${APP_NAME}-${name}
-  echo $VCAP_SERVICES | jq --raw-output --arg service_name "$service_name" ".[][] | select(.name == \$service_name) | $path"
+  if [ "$name" = "opensearch" ]; then
+    service_name=datagov-catalog-opensearch
+  fi
+  echo $VCAP_SERVICES | jq --raw-output --arg service_name "$service_name" ".[][] | select(.name == \$service_name) | ($path | if . == null then empty else . end)"
 }
 
 export APP_NAME=$(echo $VCAP_APPLICATION | jq -r '.application_name')
-export REAL_NAME=$(echo $VCAP_APPLICATION | jq -r '.application_name')
-if [[ $APP_NAME = "datagov-harvest-admin" ]] || \
-   [[ $APP_NAME = "datagov-harvest-runner" ]]
-then
-  APP_NAME=datagov-harvest
-fi
+
+# GA (google analytics)
+export GA_CREDENTIALS==$(vcap_get_service secrets .credentials.GA_CREDENTIALS)
 
 # POSTGRES DB CREDS
 export URI=$(vcap_get_service db .credentials.uri)
-export DATABASE_URI=$(echo $URI | sed 's/postgres:\/\//postgresql:\/\//g')
+export DATABASE_URI=$(echo $URI | sed 's/postgres:\/\//postgresql+psycopg:\/\//g')
 
 # CF CREDS for CF TASKS API
 export CF_SERVICE_AUTH=$(vcap_get_service secrets .credentials.CF_SERVICE_AUTH)
 export CF_SERVICE_USER=$(vcap_get_service secrets .credentials.CF_SERVICE_USER)
 
 export FLASK_APP_SECRET_KEY=$(vcap_get_service secrets .credentials.FLASK_APP_SECRET_KEY)
+export HARVEST_API_TOKEN=$(vcap_get_service secrets .credentials.HARVEST_API_TOKEN)
 export OPENID_PRIVATE_KEY=$(vcap_get_service secrets .credentials.OPENID_PRIVATE_KEY)
-
-export CKAN_API_TOKEN=$(vcap_get_service secrets .credentials.CKAN_API_TOKEN)
+export HARVEST_RUNNER_MAX_TASKS=${HARVEST_RUNNER_MAX_TASKS:-3}
 
 # New Relic
 export NEW_RELIC_LICENSE_KEY=$(vcap_get_service secrets .credentials.NEW_RELIC_LICENSE_KEY)
@@ -40,10 +40,27 @@ export HARVEST_SMTP_SERVER=$(vcap_get_service smtp .credentials.smtp_server)
 export HARVEST_SMTP_STARTTLS=True
 export HARVEST_SMTP_USER=$(vcap_get_service smtp .credentials.smtp_user)
 export HARVEST_SMTP_PASSWORD=$(vcap_get_service smtp .credentials.smtp_password)
-export HARVEST_SMTP_SENDER=harvester@$(vcap_get_service smtp .credentials.domain_arn | grep -o "ses-[[:alnum:]]\+.ssb.data.gov")
-export HARVEST_SMTP_RECIPIENT=datagovhelp@gsa.gov
+export HARVEST_SMTP_SENDER=harvester@$(vcap_get_service smtp .credentials.domain_arn | grep -o "ses-[[:alnum:]]\+.appmail.cloud.gov")
+export HARVEST_SMTP_RECIPIENT=datagovteam@gsa.gov
 
+# OpenSearch host and credentials
+export OPENSEARCH_HOST=$(vcap_get_service opensearch .credentials.host)
+export OPENSEARCH_ACCESS_KEY=$(vcap_get_service opensearch .credentials.access_key)
+export OPENSEARCH_SECRET_KEY=$(vcap_get_service opensearch .credentials.secret_key)
 
-if [[ $REAL_NAME = "datagov-harvest-admin" ]]; then
-  flask db upgrade
+echo "Setting CA Bundle.."
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# egress proxy
+echo "Setting up egress proxy.."
+if [ -z ${proxy_url+x} ]; then
+  echo "Egress proxy is not connected."
+else
+  echo "Egress proxy is enabled, excluding internal domains.."
+  export no_proxy=".apps.internal,${OPENSEARCH_HOST}"
+  export http_proxy=$proxy_url
+  export https_proxy=$proxy_url
 fi
+
+# migrations are handled in app-start.sh

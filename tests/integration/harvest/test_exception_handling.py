@@ -1,12 +1,18 @@
 # ruff: noqa: F841
 
-import json
+import smtplib
 from unittest.mock import Mock, patch
 
-import ckanapi
 import pytest
+from requests.exceptions import HTTPError
+from requests.models import Response
 
-from harvester.exceptions import ExtractExternalException, ExtractInternalException
+from harvester.exceptions import (
+    ExtractExternalException,
+    ExtractInternalException,
+    SendNotificationException,
+    log_non_critical_error,
+)
 from harvester.harvest import HarvestSource
 
 
@@ -29,7 +35,7 @@ class TestHarvestJobExceptionHandling:
         harvest_source = HarvestSource(harvest_job.id)
 
         with pytest.raises(ExtractExternalException) as e:
-            harvest_source.prepare_external_data()
+            harvest_source.acquire_minimum_external_data()
 
         assert harvest_job.status == "error"
 
@@ -49,11 +55,11 @@ class TestHarvestJobExceptionHandling:
 
         harvest_source = HarvestSource(harvest_job.id)
 
-        harvest_source.internal_records_to_id_hash = Mock()
-        harvest_source.internal_records_to_id_hash.side_effect = Exception("Broken")
+        harvest_source.store_records_as_internal = Mock()
+        harvest_source.store_records_as_internal.side_effect = Exception("Broken")
 
         with pytest.raises(ExtractInternalException) as e:
-            harvest_source.get_record_changes()
+            harvest_source.acquire_minimum_internal_data()
 
         assert harvest_job.status == "error"
 
@@ -64,48 +70,52 @@ class TestHarvestJobExceptionHandling:
         with pytest.raises(ExtractInternalException) as e:
             HarvestSource(job_data_dcatus["id"])
 
-
-class TestHarvestRecordExceptionHandling:
-    @patch("harvester.harvest.ckan", ckanapi.RemoteCKAN("mock_address"))
-    @patch("harvester.harvest.download_file", download_mock)
-    def test_delete_exception(
+    def test_send_notification_exception(
         self,
         interface,
         organization_data,
-        source_data_dcatus,
-        job_data_dcatus,
-        single_internal_record,
+        source_data_dcatus_bad_url,
+        job_data_dcatus_bad_url,
     ):
+        """
+        Test that an exception is raised when sending notification emails fails.
+        """
         interface.add_organization(organization_data)
-        interface.add_harvest_source(source_data_dcatus)
-        harvest_job = interface.add_harvest_job(job_data_dcatus)
-
-        interface.add_harvest_record(single_internal_record)
+        interface.add_harvest_source(source_data_dcatus_bad_url)
+        harvest_job = interface.add_harvest_job(job_data_dcatus_bad_url)
 
         harvest_source = HarvestSource(harvest_job.id)
-        harvest_source.get_record_changes()
-        harvest_source.write_compare_to_db()
-        harvest_source.synchronize_records()
 
-        interface_record = interface.get_harvest_record(
-            harvest_source.internal_records_lookup_table[
-                single_internal_record["identifier"]
-            ]
-        )
-        interface_errors = interface.get_harvest_record_errors_by_record(
-            harvest_source.internal_records_lookup_table[
-                single_internal_record["identifier"]
-            ]
-        )
-        assert (
-            interface_record.id
-            == harvest_source.internal_records_lookup_table[
-                single_internal_record["identifier"]
-            ]
-        )
-        assert interface_record.status == "error"
-        assert interface_errors[0].type == "SynchronizeException"
+        job_results = {
+            "records_added": 1,
+            "records_updated": 2,
+            "records_deleted": 0,
+            "records_ignored": 0,
+            "records_errored": 0,
+            "records_validated": 3,
+        }
 
+        harvest_source.notification_emails = ["user@example.com"]
+
+        with patch(
+            "harvester.utils.general_utils.smtplib.SMTP",
+            side_effect=smtplib.SMTPConnectError(421, "Cannot connect"),
+        ):
+            with pytest.raises(SendNotificationException) as exc_info:
+                harvest_source.send_notification_emails(job_results)
+
+            assert "Error preparing or sending notification emails" in str(
+                exc_info.value
+            )
+
+
+def make_http_error(status_code):
+    response = Response()
+    response.status_code = status_code
+    return HTTPError(f"{status_code} Error", response=response)
+
+
+class TestHarvestRecordExceptionHandling:
     def test_validation_exception(
         self,
         interface,
@@ -118,138 +128,58 @@ class TestHarvestRecordExceptionHandling:
         harvest_job = interface.add_harvest_job(job_data_dcatus_invalid)
 
         harvest_source = HarvestSource(harvest_job.id)
-        harvest_source.get_record_changes()
-        harvest_source.write_compare_to_db()
-        harvest_source.synchronize_records()
-        test_record = harvest_source.external_records["null-spatial"]
+        harvest_source.acquire_data_sources()
 
-        interface_record = interface.get_harvest_record(
-            harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
-        interface_errors = interface.get_harvest_record_errors_by_record(
-            harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
-        assert (
-            interface_record.id
-            == harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
+        external_records_to_process = harvest_source.external_records_to_process()
+
+        # there's only 1
+        test_record = list(external_records_to_process)[0]
+        test_record.compare()
+        test_record.validate()
+
+        interface_record = interface.get_harvest_record(test_record.id)
+        interface_errors = interface.get_harvest_record_errors_by_record(test_record.id)
+        assert interface_record.id == interface_errors[0].harvest_record_id
         assert interface_record.status == "error"
-        assert interface_errors[0].type == "ValidationException"
+        assert interface_errors[0].type == "ValidationError"
+        assert interface_errors[0].severity == "error"
 
-    @patch("harvester.utils.ckan_utils.ckanify_dcatus", side_effect=Exception("Broken"))
-    def test_dcatus_to_ckan_exception(
-        self,
-        ckanify_dcatus_mock,
-        interface,
-        organization_data,
-        source_data_dcatus,
-        job_data_dcatus,
-    ):
-        interface.add_organization(organization_data)
-        interface.add_harvest_source(source_data_dcatus)
-        harvest_job = interface.add_harvest_job(job_data_dcatus)
-
-        harvest_source = HarvestSource(harvest_job.id)
-        harvest_source.get_record_changes()
-        harvest_source.write_compare_to_db()
-        harvest_source.synchronize_records()
-
-        test_record = harvest_source.external_records["cftc-dc1"]
-
-        interface_record = interface.get_harvest_record(
-            harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
-        interface_errors = interface.get_harvest_record_errors_by_record(
-            harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
-
-        assert ckanify_dcatus_mock.call_count == len(harvest_source.external_records)
-        assert (
-            interface_record.id
-            == harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
-        assert interface_record.status == "error"
-        assert interface_errors[0].type == "DCATUSToCKANException"
-
-    # ruff: noqa: F401
-    @patch("harvester.harvest.ckan", ckanapi.RemoteCKAN("mock_address"))
-    def test_ckan_sync_exception(
+    def test_log_non_critical_error_severity(
         self,
         interface,
         organization_data,
         source_data_dcatus,
         job_data_dcatus,
+        record_data_dcatus,
     ):
         interface.add_organization(organization_data)
         interface.add_harvest_source(source_data_dcatus)
         harvest_job = interface.add_harvest_job(job_data_dcatus)
+        record = interface.add_harvest_record(record_data_dcatus[2])
 
-        harvest_source = HarvestSource(harvest_job.id)
-        harvest_source.get_record_changes()
-        harvest_source.write_compare_to_db()
-        harvest_source.synchronize_records()
-
-        test_record = harvest_source.external_records["cftc-dc1"]
-
-        interface_record = interface.get_harvest_record(
-            harvest_source.internal_records_lookup_table[test_record.identifier]
+        # severity defaults to "error"
+        log_non_critical_error(
+            "an error",
+            harvest_job.id,
+            record.id,
+            "TestException",
+            emit_log=False,
+        )
+        # severity can be set to "warning"
+        log_non_critical_error(
+            "a warning",
+            harvest_job.id,
+            record.id,
+            "TestException",
+            emit_log=False,
+            severity="warning",
         )
 
-        interface_errors = interface.get_harvest_record_errors_by_record(
-            harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
+        # severity=None so both the error and the warning are returned
+        errors = interface.get_harvest_record_errors_by_record(record.id, severity=None)
+        severities = {err.message: err.severity for err in errors}
+        assert severities["an error"] == "error"
+        assert severities["a warning"] == "warning"
 
-        assert (
-            interface_record.id
-            == harvest_source.internal_records_lookup_table[test_record.identifier]
-        )
-        assert interface_record.status == "error"
-        assert interface_errors[0].type == "SynchronizeException"
-
-    @patch("harvester.harvest.ckan")
-    @patch("harvester.utils.ckan_utils.uuid")
-    def test_validate_nested_exception_handling(
-        self,
-        UUIDMock,
-        CKANMock,
-        interface,
-        organization_data,
-        source_data_dcatus_same_title,
-    ):
-        UUIDMock.uuid4.return_value = 12345
-        # ruff: noqa: E501
-        CKANMock.action.package_create.side_effect = [
-            {"id": 1234},
-            Exception(
-                "ValidationError({'name': ['That URL is already in use.'], '__type': 'Validation Error'}"
-            ),
-            Exception("Some other error occurred"),
-        ]
-        interface.add_organization(organization_data)
-        interface.add_harvest_source(source_data_dcatus_same_title)
-        harvest_job = interface.add_harvest_job(
-            {
-                "status": "new",
-                "harvest_source_id": source_data_dcatus_same_title["id"],
-            }
-        )
-        job_id = harvest_job.id
-        harvest_source = HarvestSource(job_id)
-        harvest_source.get_record_changes()
-        harvest_source.write_compare_to_db()
-        harvest_source.synchronize_records()
-        harvest_source.report()
-
-        harvest_records = interface.get_harvest_records_by_job(job_id)
-        records_with_errors = [
-            record for record in harvest_records if record.status == "error"
-        ]
-        job_err = interface.get_harvest_job_errors_by_job(job_id)
-        record_err = interface.get_harvest_record_errors_by_job(job_id)
-        assert len(job_err) == 0
-        assert len(record_err) == 1
-        assert record_err[0].type == "SynchronizeException"
-        assert record_err[0].harvest_record_id == records_with_errors[0].id
-        assert (
-            harvest_records[1].id == records_with_errors[0].id
-        )  ## assert it's the second record that threw the exception, which validates our package_create mock
+        record = interface.get_harvest_record(record.id)
+        assert record.status == "error"

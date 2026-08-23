@@ -1,10 +1,35 @@
 const { src, pipe, dest, series, parallel, watch } = require('gulp');
 const uswds = require("@uswds/compile");
 
+var browserify = require('browserify');
+var source = require('vinyl-source-stream');
+var buffer = require('vinyl-buffer');
+
+// file path vars
+const paths = {
+    js: {
+        src: './js/index.js',
+        dest: 'assets/js/bundle.js'
+    }
+}
+
+function jsTask() {
+    return browserify(`${paths.js.src}`)
+        .transform('babelify', {
+            presets: ['@babel/preset-env'],
+            plugins: ['@babel/plugin-transform-runtime']
+        })
+        .bundle()
+        .pipe(source(paths.js.dest))
+        .pipe(buffer())
+        .pipe(dest("./"));
+};
+
 const defaultTask = parallel(
     series(
-        uswds.compile,
+        jsTask,
         uswds.copyAssets,
+        uswds.compile,
     )
 )
 
@@ -34,9 +59,17 @@ uswds.paths.dist.theme = './_scss';
 * Add as many as you need
 */
 exports.compile = uswds.compile;
-exports.watch = uswds.watch;
 exports.init = uswds.init;
 exports.copyAll = uswds.copyAll;
 exports.copyAssets = uswds.copyAssets;
 exports.updateUswds = uswds.updateUswds;
-// exports.default = uswds.watch;
+
+function watchDev() {
+    watch('./js/**/*.js', jsTask);
+    watch('./_scss/**/*.scss', uswds.compileSass);
+}
+
+exports.watch = series(
+    parallel(jsTask, uswds.copyAssets, uswds.compile),
+    watchDev
+);

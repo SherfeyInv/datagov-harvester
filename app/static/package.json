@@ -24,12 +24,10 @@
     "test": "test"
   },
   "dependencies": {
-    "@uswds/uswds": "3.13.0",
-    "aria-accordion": "^1.0.0",
-    "chart.js": "^4.5.1",
-    "htmx.org": "^2.0.10",
-    "list.js": "^2.3.1",
-    "object-assign": "^4.1.1"
+    "@uswds/uswds": "3.8.2",
+    "chart.js": "^4.4.5",
+    "htmx.org": "^2.0.3",
+    "rollup": "^4.24.0"
   },
   "devDependencies": {
     "@babel/core": "^7.29.7",

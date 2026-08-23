@@ -1,0 +1,34 @@
+.error-list {
+    display: flex;
+    flex-direction: column;
+    gap: units(2);
+}
+
+.error-block {
+    border: units("2px") solid color('gray-cool-10');
+    padding: units(2);
+    border-radius: radius("md");
+    background-color: color('gray-5');
+
+    h3 {
+        margin: 0;
+        font-size: font-size("body", "lg");
+        font-weight: font-weight("bold");
+        color: color('gray-90');
+    }
+
+    p {
+        margin: units("05") 0;
+        font-size: font-size("body", "sm");
+        text-indent: units(2);
+    }
+
+    a {
+        color: color('blue-60v');
+        text-decoration: none;
+
+        &:hover {
+            text-decoration: underline;
+        }
+    }
+}

@@ -5,16 +5,42 @@
 {% endblock %}
 
 {% block content %}
-<h2>{{action}} {{data_type}}</h2>
-<form action="{{ form_action }}" method="{{ method | d('POST') }}">
+<h1>{{action}} {{data_type}}</h1>
+<form class="usa-form usa-form--large" action="{{ form_action }}" method="{{ method | d('POST') }}">
     {{ form.hidden_tag() }}
-    {% for field in form if field.widget.input_type != 'hidden' %}
-    <div class="form-group">
-        {{field.label(class_='form-control-label')}}
-        {{field(class_='form-control')}}
-    </div>
-    {% endfor %}
+    <fieldset class="usa-fieldset">
+        <legend class="usa-legend usa-sr-only">{{action}} {{data_type}}</legend>
+        <p class="usa-hint margin-top-0">
+            A red asterisk (<abbr class="usa-hint usa-hint--required" title="required">*</abbr>) indicates a required field.
+        </p>
+        {% for field in form if field.widget.input_type != 'hidden' %}
+        {% set field_class = 'usa-textarea' if field.type == 'TextAreaField' else ('usa-select' if field.type == 'SelectField' else 'usa-input') %}
+        {% set show_collection_parent_url = form.source_type is defined and form.source_type.data == 'waf-collection' %}
+        <div class="usa-form-group"
+            {% if field.id == 'collection_parent_url' %}
+                data-collection-parent-url-group
+                {% if not show_collection_parent_url %}hidden{% endif %}
+            {% endif %}>
+            <label for="{{ field.id }}" class="usa-label">
+                {{ field.label.text }}
+                {% if field.flags.required %}
+                    <abbr class="usa-hint usa-hint--required" title="required">*</abbr>
+                {% endif %}
+            </label>
+            {% if field.description %}
+                <span class="usa-hint" id="{{ field.id }}-hint">{{ field.description }}</span>
+            {% endif %}
+            {% if data_type == "Harvest Source" and action == "Edit" and field.id == 'name' %}
+                {{field(class_=field_class, readonly_=true, aria_label=field.label.text)}}
+            {% else %}
+                {{field(class_=field_class, aria_label=field.label.text)}}
+            {% endif %}
+        </div>
+        {% endfor %}
 
-    <button type="submit" class="btn btn-primary">{{button}}</button>
+        <div class="usa-form-group">
+            <button type="submit" class="usa-button">{{button}}</button>
+        </div>
+    </fieldset>
 </form>
 {% endblock %}

@@ -1,7 +1,12 @@
+SHELL=/bin/bash -o pipefail
+
 all: help
 
 pypi-upload: build-dist  ## Uploads new package to PyPi after clean, build
 	poetry publish
+
+poetry-update: ## Updates local Poetry to latest
+	poetry self update
 
 update-dependencies: ## Updates requirements.txt and requirements_dev.txt from pyproject.toml
 	poetry export --without-hashes --without=dev --format=requirements.txt > requirements.txt
@@ -27,23 +32,53 @@ install-static: ## Installs static assets
 	npm install; \
 	npm run build
 
-test-unit: ## Runs unit tests. Compatible with dev environment / `make up`
-	poetry run pytest --junitxml=pytest.xml --cov=harvester ./tests/unit
+watch-static: ## Rebuild static assets when SCSS/JS changes
+	cd app/static; \
+	npm install; \
+	npm run watch
 
-test-integration: ## Runs integration tests. Compatible with dev environment / `make up`
-	poetry run pytest --junitxml=pytest.xml --cov=harvester ./tests/integration
+update-fixtures: ## Updates test fixtures with fresh dates
+	python tests/generate_fixtures.py
 
-test-functional: ## Runs integration tests. Compatible with dev environment / `make up`
-	poetry run pytest --noconftest --junitxml=pytest.xml --cov=harvester ./tests/functional
+test-fresh: update-fixtures ## Run tests with fresh fixtures
+	pytest
 
-test: up test-unit test-integration ## Runs all tests. Compatible with dev environment / `make up`
+test-unit-fresh: update-fixtures ## Run unit tests with fresh fixtures  
+	pytest tests/unit/
 
-test-ci: ## Runs all tests using only db and required test resources. NOT compatible with dev environment / `make up`
-	docker compose up -d db nginx-harvest-source transformer
-	make test-unit
-	make test-integration
-	make test-functional
-	make down
+test-functional-fresh: update-fixtures ## Run functional tests with fresh fixtures
+	pytest tests/functional/
+
+load-test-data: ## Loads fixture test data
+	docker compose exec app flask testdata load_test_data
+
+ensure-badge-dirs: ## Creates local badge output dirs used by pytest-local-badge
+	mkdir -p tests/badges/unit tests/badges/integration tests/badges/functional tests/badges/playwright
+
+test-unit: ensure-badge-dirs ## Runs unit tests.
+	poetry run pytest  --local-badge-output-dir tests/badges/unit/ --cov-report term-missing --junitxml=pytest-unit.xml --cov=harvester --cov=database --cov=search ./tests/unit | tee pytest-coverage-unit.txt
+
+test-integration: ensure-badge-dirs ## Runs integration tests.
+	poetry run pytest --local-badge-output-dir tests/badges/integration/ --cov-report term-missing --junitxml=pytest-integration.xml --cov=harvester --cov=database --cov=search ./tests/integration | tee pytest-coverage-integration.txt
+
+test-functional: ensure-badge-dirs ## Runs functional tests.
+	poetry run pytest --local-badge-output-dir tests/badges/functional/ --noconftest --cov-report term-missing --junitxml=pytest-functional.xml --cov=harvester ./tests/functional | tee pytest-coverage-functional.txt
+
+test-playwright: ensure-badge-dirs ## Runs playwright tests.
+	poetry run pytest --local-badge-output-dir tests/badges/playwright/ --cov-report term-missing --junitxml=pytest-playwright.xml --cov=app ./tests/playwright | tee pytest-coverage-playwright.txt
+
+test-scripts: ## Runs script tests.
+	poetry run pytest --cov-report term-missing --cov=harvester ./tests/scripts | tee pytest-coverage-scripts.txt
+
+test: up test-unit test-integration ## Runs all local tests
+
+test-e2e-ci: re-up test-playwright test-functional ## All e2e/expensive tests. Run on PR into main.
+
+test-ci: up test-unit test-integration test-scripts ## All simulated tests using only db and required test resources. Run on commit.
+
+re-up: clean up sleep-5 load-test-data ## resets system to clean fixture status
+
+re-up-debug: clean up-debug load-test-data ## resets system to clean fixture status for flask debugging
 
 up: ## Sets up local flask and harvest runner docker environments. harvest runner gets DATABASE_PORT from .env
 	DATABASE_PORT=5433 docker compose up -d
@@ -52,24 +87,31 @@ up: ## Sets up local flask and harvest runner docker environments. harvest runne
 up-unified: ## For testing when you want a shared db between flask and harvester
 	docker compose up -d
 
-down: ## Tears down the flask and harvester containers
-	docker compose down
-	docker compose -p harvest-app down
-
 up-debug: ## Sets up local docker environment with VSCODE debug support enabled
 	docker compose -f docker-compose.yml -f docker-compose_debug.yml up -d
 
 up-prod: ## Sets up local flask env running gunicorn instead of standard dev server
 	docker compose -f docker-compose.yml -f docker-compose_prod.yml up -d
 
+down: ## Tears down the flask and harvester containers
+	docker compose down
+	docker compose -p harvest-app down
+
 clean: ## Cleans docker images
 	docker compose down -v --remove-orphans
 	docker compose -p harvest-app down -v --remove-orphans
+	
+sleep-5:
+	sleep 5
 
-lint:  ## Lints wtih ruff, isort, black
-	ruff check .
-	isort .
-	black .
+lint-check:  ## Lints wtih ruff, isort, black
+	poetry run ruff check .
+	poetry run isort --check .
+	poetry run black --check .
+
+lint-fix:  ## Fix lints with isort and black
+	poetry run isort .
+	poetry run black .
 
 # Output documentation for top-level targets
 # Thanks to https://marmelab.com/blog/2016/02/29/auto-documented-makefile.html

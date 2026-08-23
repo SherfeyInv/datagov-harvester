@@ -1,53 +1,150 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF  -8">
-    {% block title %}
-        <title>{{action}} {{data_type}}</title>
-    {% endblock %}
-    <link rel="stylesheet" href="{{ url_for('static', filename='assets/uswds/css/styles.css') }}">
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-    <script src="{{ url_for('static', filename='assets/uswds/js/uswds-init.js') }}"></script>
-    <script src="{{ url_for('static', filename='assets/htmx/htmx.min.js') }}"></script>
-    {% block script_head %}
-    {% endblock %}
-</head>
-<body>
-  {% include '/snippets/banner.html' %}
-    <header>
-      <div class="container">
-        <strong>
-          <nav>
-            <ul class="menu">
-              <li><a href="{{ url_for('harvest.index') }}">Home</a></li>
-              <li><a href="{{ url_for('harvest.view_organizations') }}">Orgs</a></li>
-              <li><a href="{{ url_for('harvest.view_harvest_sources') }}">Sources</a></li>
-              {% if session['user'] %}
-                <li>{{ session['user'] }}</li>
-                <li><a href="{{ url_for('harvest.logout') }}">Logout</a></li>
-              {% else %}
-                <li><a href="{{ url_for('harvest.login') }}">Login</a></li>
-              {% endif %}
-            </ul>
-          </nav>
-        </strong>
-      </div>
-    </header>
-    <div class="container my-3">
-        {% for message in get_flashed_messages() %}
-        <div class="alert alert-warning">
-            <button type="button" class="close" data-dismiss="alert">&times;</button>
-            {{ message }}
-        </div>
-        {% endfor %}
 
-        <div id="content">{% block content %}{% endblock %}</div>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% block title %}
+  <title>{{action}} {{data_type}}</title>
+  {% endblock %}
+  <link rel="stylesheet" href="{{ static_url('assets/uswds/css/styles.css') }}">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <script src="{{ static_url('assets/uswds/js/uswds-init.js') }}"></script>
+  <script src="{{ static_url('assets/htmx/htmx.min.js') }}"></script>
+  <script src="{{ static_url('js/datetime.js') }}"></script>
+  <!-- Google Tag Manager -->
+  <script nonce="{{ csp_nonce() }}">(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+    new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+      j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+      'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer','GTM-WZJC8CX7');</script>
+  <!-- End Google Tag Manager -->
+  {% block script_head %}
+
+  <meta name="htmx-config" content='{"inlineStyleNonce":"{{ csp_nonce() }}"}'>
+  {% endblock %}
+</head>
+
+<body class="harvester-layout">
+  <!-- Google Tag Manager (noscript) -->
+  <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-WZJC8CX7"
+  height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+  <!-- End Google Tag Manager (noscript) -->
+  <div class="harvester-layout__page">
+  {% include '/snippets/banner.html' %}
+  <div class="usa-overlay"></div>
+  <header class="usa-header usa-header--basic harvester-header">
+    <div class="usa-nav-container grid-container-widescreen">
+      <div class="usa-navbar">
+        <div class="usa-logo" id="logo">
+          <a href="{{ url_for('main.index') }}" title="Data.gov Harvester" aria-label="Data.gov Harvester home">
+            <span class="usa-sr-only">Data.gov</span>
+            <span class="usa-logo__suffix" aria-hidden="false">Harvester</span>
+          </a>
+        </div>
+        <button type="button" class="usa-menu-btn">Menu</button>
+      </div>
+      <nav aria-label="Primary navigation" class="usa-nav">
+        <button type="button" class="usa-nav__close">
+          <svg class="usa-icon" aria-hidden="true" focusable="false" role="img">
+            <use href="{{ static_url('assets/uswds/img/sprite.svg') }}#close"></use>
+          </svg>
+        </button>
+        {% if session['user'] %}
+        <div class="harvester-nav__account-mobile" aria-label="Account">
+          <span class="harvester-nav__account-name">{{ session['user'] }}</span>
+          <a class="harvester-nav__utility-link harvester-nav__logout-mobile" href="{{ url_for('main.logout') }}">Logout</a>
+        </div>
+        {% endif %}
+        <ul class="usa-nav__primary usa-accordion menu">
+          <li class="usa-nav__primary-item">
+            <a class="usa-nav__link" href="{{ url_for('main.organization_list') }}"><span>Organizations</span></a>
+          </li>
+          <li class="usa-nav__primary-item">
+            <a class="usa-nav__link" href="{{ url_for('main.harvest_source_list') }}"><span>Harvest Sources</span></a>
+          </li>
+          <li class="usa-nav__primary-item">
+            <a class="usa-nav__link" href="{{ url_for('main.openapi_docs') }}"><span>API Documentation</span></a>
+          </li>
+          <li class="usa-nav__primary-item">
+            <a class="usa-nav__link" href="{{ url_for('main.view_metrics') }}"><span>Metrics</span></a>
+          </li>
+          <li class="usa-nav__primary-item">
+            <a class="usa-nav__link" href="{{ url_for('main.view_validators') }}"><span>Validators</span></a>
+          </li>
+          <li class="usa-nav__primary-item harvester-nav__utility harvester-nav__utility-first">
+            <div class="harvester-nav__utility-group">
+              <button type="button" class="usa-button usa-button--unstyled js-glossary-toggle">
+                <svg class="usa-icon" aria-hidden="true" focusable="false" role="img">
+                  <use href="{{ static_url('assets/uswds/img/sprite.svg') }}#local_library"></use>
+                </svg>
+                <span>Glossary</span>
+              </button>
+              {% if session['user'] %}
+              <div class="harvester-nav__account-menu">
+                <div class="harvester-nav__account-desktop">
+                  <button
+                    type="button"
+                    class="harvester-nav__account-toggle js-account-menu-toggle"
+                    aria-haspopup="true"
+                    aria-expanded="false"
+                    aria-controls="account-menu"
+                    title="{{ session['user'] }}"
+                  >
+                    <span class="harvester-nav__user">{{ session['user'] }}</span>
+                    <svg class="usa-icon harvester-nav__account-chevron" aria-hidden="true" focusable="false" role="img">
+                      <use href="{{ static_url('assets/uswds/img/sprite.svg') }}#expand_more"></use>
+                    </svg>
+                  </button>
+                  <ul id="account-menu" class="harvester-nav__account-dropdown" role="menu" hidden>
+                    <li role="none">
+                      <a class="harvester-nav__account-dropdown-link" role="menuitem" href="{{ url_for('main.logout') }}">Logout</a>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+              {% else %}
+              <a class="harvester-nav__utility-link" href="{{ url_for('main.login', next=request.full_path) }}">Login</a>
+              {% endif %}
+            </div>
+          </li>
+        </ul>
+      </nav>
     </div>
-    {% include '/snippets/footer.html' %}
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
-    <script src="{{ url_for('static', filename='assets/uswds/js/uswds.js') }}"></script>
-    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
-    {% block scripts %}
-    {% endblock %}
+  </header>
+
+  {% include 'glossary.html' %}
+
+  <div class="harvester-layout__main grid-container-widescreen margin-y-3">
+    {% set _category_map = {
+      'success': 'usa-alert--success',
+      'warning': 'usa-alert--warning',
+      'danger':  'usa-alert--error',
+      'error':   'usa-alert--error'
+    } %}
+    <div role="region" aria-label="Notifications" aria-live="polite">
+      {% for category, message in get_flashed_messages(with_categories=true) %}
+      <div class="usa-alert {{ _category_map.get(category, 'usa-alert--warning') }} usa-alert--dismissible margin-bottom-2">
+        <div class="usa-alert__body">
+          <p class="usa-alert__text">{{ message }}</p>
+        </div>
+        <button type="button" class="usa-alert__close js-alert-close" aria-label="Close alert">
+          <svg class="usa-icon" aria-hidden="true" role="img" focusable="false">
+            <use href="{{ static_url('assets/uswds/img/sprite.svg') }}#close"></use>
+          </svg>
+        </button>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div id="content">{% block content %}{% endblock %}</div>
+  </div>
+  </div>
+  {% include '/snippets/footer.html' %}
+  <script src="{{ static_url('assets/uswds/js/uswds.js') }}"></script>
+  <script src="{{ static_url('assets/js/bundle.js') }}"></script>
+  {% block scripts %}
+  {% endblock %}
 </body>
+
 </html>

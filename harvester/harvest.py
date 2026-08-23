@@ -1,56 +1,70 @@
-# ruff: noqa: F841
-# ruff: noqa: E402
-import functools
+import gc
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
+from typing import List
 
 import requests
-from boltons.setutils import IndexedSet
-from ckanapi import RemoteCKAN
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
+from requests.exceptions import HTTPError, Timeout
+from sqlalchemy.exc import IntegrityError
 
 sys.path.insert(1, "/".join(os.path.realpath(__file__).split("/")[0:-2]))
 
-from harvester import SMTP_CONFIG
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
-from harvester import HarvesterDBInterface, db_interface
+from database.models import HarvestSource as HarvestSourceORM
+
+# ruff: noqa: E402
+from harvester import SMTP_CONFIG, HarvesterDBInterface, db_interface
 from harvester.exceptions import (
+    ClearJobException,
     CompareException,
-    DCATUSToCKANException,
+    DuplicateIdentifierException,
+    ExternalRecordToClass,
     ExtractExternalException,
     ExtractInternalException,
-    SynchronizeException,
+    NoIdentifierException,
+    SendNotificationException,
+    SpatialTransformationException,
     TransformationException,
-    ValidationException,
+    log_non_critical_error,
 )
+from harvester.lib.harvest_reporter import HarvestReporter
+from harvester.lib.load_manager import LoadManager
+from harvester.lib.task_handler import create_task_handler
+from harvester.utils.dcat_warnings import DcatWarning, detect_dcat_warnings
 from harvester.utils.general_utils import (
+    DT_PLACEHOLDER,
+    USER_AGENT,
+    add_uuid_to_package_name,
+    assemble_validation_errors,
+    build_dcatus3_validator,
     dataset_to_hash,
+    describe_identifier_error,
     download_file,
-    download_waf,
+    extract_dcatus3_catalog_dataset_series,
+    extract_dcatus3_catalog_datasets,
+    extract_dcatus3_catalog_records,
+    extract_dcatus3_catalog_services,
+    extract_dcatus3_nested_datasets,
+    find_indexes_for_duplicates,
+    get_datetime,
+    make_record_mapping,
+    munge_title_to_name,
+    normalize_dataset_identifier,
     open_json,
+    prepare_distributions,
     prepare_transform_msg,
+    send_email_to_recipients,
     sort_dataset,
+    strip_dcatus3_catalog_objects,
+    translate_spatial_to_geojson,
     traverse_waf,
-)
-
-# requests data
-session = requests.Session()
-# TODD: make sure this timeout config doesn't change all requests!
-session.request = functools.partial(session.request, timeout=15)
-
-# ckan entrypoint
-ckan = RemoteCKAN(
-    os.getenv("CKAN_API_URL"),
-    apikey=os.getenv("CKAN_API_TOKEN"),
-    session=session,
 )
 
 # logging data
@@ -58,12 +72,42 @@ logger = logging.getLogger("harvest_runner")
 
 ROOT_DIR = Path(__file__).parents[1]
 
+# harvest worker count
+harvest_worker_sync_count = int(os.getenv("HARVEST_WORKER_SYNC_COUNT", 1))
+
+# DCAT-US 3.0 record types other than "dataset" (which has its own more
+# complex extraction path shared with WAF/ISO sources). Each entry's
+# "extractor" pulls its objects out of a dcatus3.0 Catalog dict; its
+# "identifier_field" is the dict key that holds the record's identifier --
+# CatalogRecord and DatasetSeries have no "identifier" field, only a
+# top-level "@id". "schema_ref" is the dcatus3.0 definitions root_ref used
+# to build this type's validator -- built from this registry (not
+# hand-listed) so a new entry can't forget to wire up validation.
+NON_DATASET_RECORD_TYPES = {
+    "data_service": {
+        "extractor": extract_dcatus3_catalog_services,
+        "identifier_field": "identifier",
+        "schema_ref": "dataservice",
+    },
+    "catalog_record": {
+        "extractor": extract_dcatus3_catalog_records,
+        "identifier_field": "@id",
+        "schema_ref": "catalogrecord",
+    },
+    "data_series": {
+        "extractor": extract_dcatus3_catalog_dataset_series,
+        "identifier_field": "@id",
+        "schema_ref": "datasetseries",
+    },
+}
+
 
 @dataclass
 class HarvestSource:
     """Class for Harvest Sources"""
 
     _job_id: str
+    _job_type: str = "harvest"
 
     _source_attrs: dict = field(
         default_factory=lambda: [
@@ -72,50 +116,157 @@ class HarvestSource:
             "organization_id",
             "schema_type",
             "source_type",
+            "collection_parent_url",
             "id",  # db guuid
-            "notification_emails"
+            "notification_emails",
+            "notification_frequency",
         ],
         repr=False,
     )
-
+    _records: list = field(default_factory=lambda: [], repr=False)
     _dataset_schema: dict = field(default_factory=lambda: {}, repr=False)
     _no_harvest_resp: bool = False
+    _clear_complete: bool = True
 
-    # not read-only because these values are added after initialization
-    # making them a "property" would require a setter which, because they are dicts,
-    # means creating a custom dict class which overloads the __set_item__ method
-    # worth it? not sure...
-    # since python 3.7 dicts are insertion ordered so deletions will occur first
-    compare_data: dict = field(
-        default_factory=lambda: {"delete": set(), "create": set(), "update": set()},
-        repr=False,
-    )
     external_records: dict = field(default_factory=lambda: {}, repr=False)
+    # DCAT-US 3.0 record types other than "dataset" (data_service,
+    # catalog_record, ...), keyed by record_type. Always empty for other
+    # schema types. See NON_DATASET_RECORD_TYPES for the catalog field and
+    # identifier field backing each record_type.
+    external_records_by_type: dict = field(default_factory=lambda: {}, repr=False)
+    # keyed by (identifier, record_type), not identifier alone, so a Dataset
+    # and a DataService sharing an identifier don't collide.
     internal_records: dict = field(default_factory=lambda: {}, repr=False)
+
+    deletions: set = field(default_factory=lambda: set(), repr=False)
+    _opensearch: object = field(default=None, init=False, repr=False)
+    _opensearch_initialized: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._db_interface: HarvesterDBInterface = db_interface
         self.get_source_info_from_job_id(self.job_id)
 
+        self.schemas_root = ROOT_DIR / "schemas"
+
         if self.schema_type == "dcatus1.1: federal":
-            self.dataset_schema = open_json(
-                ROOT_DIR / "schemas" / "federal_dataset.json"
+            self.schema_file = self.schemas_root / "dcatus1.1" / "federal_dataset.json"
+        elif self.schema_type in ["dcatus1.1: non-federal"]:
+            self.schema_file = (
+                self.schemas_root / "dcatus1.1" / "non-federal_dataset.json"
+            )
+        elif self.schema_type == "dcatus3.0":
+            # dcatus3.0 has a single dataset schema (no federal/non-federal split).
+            # A 3.0 dataset identifier may be a string or an object; object
+            # identifiers must provide @id.
+            self.schema_file = (
+                self.schemas_root / "dcatus3.0" / "definitions" / "Dataset.json"
+            )
+        elif self.schema_type.startswith("iso19115"):
+            self.schema_file = (
+                self.schemas_root / "dcatus1.1" / "iso-non-federal_dataset.json"
             )
         else:
-            self.dataset_schema = open_json(
-                ROOT_DIR / "schemas" / "non-federal_dataset.json"
+            # this can't happen because we apply an enum in our model but just in case.
+            logger.error(
+                f"unacceptable schema type: {self.schema_type}. exiting harvest."
             )
+            self.finish_job_with_status("error")
+            raise Exception
+
+        self.dataset_schema = open_json(self.schema_file)
+        if self.schema_type == "dcatus3.0":
+            # validate one record at a time against the dcatus3.0 schema
+            # matching its record_type, which plugs into the same per-record
+            # validation flow as dcatus1.1.
+            definitions_dir = self.schemas_root / "dcatus3.0" / "definitions"
+            self._validators = {
+                "dataset": build_dcatus3_validator(
+                    definitions_dir,
+                    root_ref="https://resources.data.gov/dcat-us/3.0.0/definitions/dataset",
+                ),
+            }
+            for record_type, config in NON_DATASET_RECORD_TYPES.items():
+                self._validators[record_type] = build_dcatus3_validator(
+                    definitions_dir,
+                    root_ref=(
+                        "https://resources.data.gov/dcat-us/3.0.0/definitions/"
+                        f"{config['schema_ref']}"
+                    ),
+                )
+        else:
+            self._validators = {
+                "dataset": Draft202012Validator(
+                    self.dataset_schema, format_checker=FormatChecker()
+                )
+            }
+        self._reporter = HarvestReporter()
 
     @property
     def job_id(self) -> str:
         return self._job_id
 
     @property
+    def job_type(self) -> str:
+        return self._job_type
+
+    @property
     def db_interface(self) -> HarvesterDBInterface:
         return self._db_interface
 
+    def validator_for(self, record_type: str):
+        """Return the schema validator for [record_type].
+
+        Non-dcatus3.0 sources only have a "dataset" validator, since they
+        have no concept of other DCAT-US 3.0 record types. Raises rather
+        than silently falling back to the dataset validator for an unknown
+        record_type -- that fallback previously masked a missing
+        data_series validator entry by validating DatasetSeries objects
+        against the Dataset schema instead.
+        """
+        try:
+            return self._validators[record_type]
+        except KeyError:
+            raise ValueError(f"no validator registered for record_type '{record_type}'")
+
     @property
-    def source_attrs(self) -> list:
+    def records(self):
+        return self._records
+
+    @records.setter
+    def records(self, value) -> None:
+        self._records = value
+
+    @property
+    def reporter(self):
+        return self._reporter
+
+    @property
+    def opensearch(self):
+        if self._opensearch_initialized:
+            return self._opensearch
+
+        self._opensearch_initialized = True
+        opensearch_host = os.getenv("OPENSEARCH_HOST")
+        if not opensearch_host:
+            self._opensearch = None
+            return None
+
+        try:
+            from search.client import OpenSearchClient
+            from search.writer import OpenSearchWriter
+
+            client = OpenSearchClient.from_environment()
+            writer = OpenSearchWriter(client)
+
+            self._opensearch = writer
+        except Exception as e:
+            logger.exception("Failed to initialize OpenSearch client: %s", e)
+            self._opensearch = None
+
+        return self._opensearch
+
+    @property
+    def source_attrs(self) -> List:
         return self._source_attrs
 
     @property
@@ -138,6 +289,16 @@ class HarvestSource:
             raise ValueError("No harvest response field must be a boolean")
         self._no_harvest_resp = value
 
+    @property
+    def clear_complete(self) -> bool:
+        return self._clear_complete
+
+    @clear_complete.setter
+    def clear_complete(self, value) -> None:
+        if not isinstance(value, bool):
+            raise ValueError("Clear complete must be a boolean")
+        self._clear_complete = value
+
     def get_source_info_from_job_id(self, job_id: str) -> None:
         # TODO: validate values here?
         try:
@@ -146,300 +307,583 @@ class HarvestSource:
                 setattr(self, attr, getattr(source_data, attr))
         except Exception as e:
             raise ExtractInternalException(
-                f"failed to extract source info from {job_id}. exiting",
+                f"failed to extract source info from {job_id}. exiting :: {repr(e)}",
                 self.job_id,
             )
 
-    def internal_records_to_id_hash(self, records: list[dict]) -> None:
+    def update_job_record_count_by_action(self, action: str):
+        """updates the record action counter in the reporter
+        and updates the job with new count dict
+
+        record actions are:
+            create
+            update
+            delete
+            None (unchanged)
+            errored
+            validated
+            warned
+        """
+        self.reporter.update(action)
+        self.db_interface.update_harvest_job(self.job_id, self.reporter.report())
+
+    def get_source_orm(self) -> HarvestSourceORM:
+        """Get the harvest source object from the database."""
+        return self.db_interface.get_harvest_source_by_jobid(self.job_id)
+
+    def store_records_as_internal(self, records: List[dict]) -> None:
+        """
+        converts the list of db records into Record instances and stores them
+        in self.internal_records
+
+        records: list of internal db harvest record dicts
+        """
         for record in records:
-            self.internal_records[record["identifier"]] = Record(
+            record_type = record["record_type"]
+            self.internal_records[(record["identifier"], record_type)] = Record(
                 self,
                 record["identifier"],
-                record["source_raw"],
+                None,  # source raw
                 record["source_hash"],
                 _ckan_id=record["ckan_id"],
-                _ckan_name=record["ckan_name"],
+                _dataset_slug=record.get("dataset_slug"),
+                _date_finished=record["date_finished"],
+                _parent_identifier=record.get("parent_identifier"),
+                _record_type=record_type,
             )
 
-    def get_record_identifier(self, record: dict) -> str:
+    def write_duplicate_to_db(self, identifier: str, record_type: str) -> None:
+        """
+        duplicates are identified by index prior to function call so every input to this
+        function is a duplicate. given the duplicate identifier write to the db as a
+        duplicate identifier record error.
 
-        record_id = "identifier" if self.schema_type.startswith("dcatus") else "url"
+        identifier: identifier of the record ("identifier" in datajson or full xml path in waf)
+        """
+        # Create a minimal harvest_record for error tracking purposes only
+        record_data = {
+            "harvest_job_id": self.job_id,
+            "harvest_source_id": self.id,
+            "identifier": identifier,
+            "status": "error",
+            "record_type": record_type,
+        }
 
-        if record_id not in record:
-            raise Exception
+        # Insert the record so it can be referenced in the error table
+        new_record = self.db_interface.add_harvest_record(record_data)
+        harvest_record_id = new_record.id if new_record else None
 
-        record_id = record[record_id].strip()
+        raise DuplicateIdentifierException(
+            f"Duplicate identifier '{identifier}' found for source: {self.name}",
+            self.job_id,
+            harvest_record_id,
+        )
 
-        if record_id == "":
-            raise Exception
+    def _filter_duplicate_identifiers_from(
+        self, records: list, record_type: str, identifier_field: str = "identifier"
+    ) -> None:
+        """
+        removes records with a duplicate identifier from [records] in place,
+        recording a duplicate-identifier record error for each one removed.
 
-        return record_id
-
-    def external_records_to_id_hash(self, records: list[dict]) -> None:
-        # ruff: noqa: F841
-
-        logger.info("converting harvest records to id: hash")
-        for record in records:
+        shared helper behind filter_duplicate_identifiers so each record_type
+        is deduplicated independently, tagged with the right record_type.
+        """
+        indices = find_indexes_for_duplicates(records, identifier_field)
+        for idx in indices:
             try:
+                identifier = normalize_dataset_identifier(
+                    records[idx].get(identifier_field)
+                )
+                self.write_duplicate_to_db(identifier, record_type)
+            except DuplicateIdentifierException:
+                del records[idx]
+                self.update_job_record_count_by_action("errored")
 
-                identifier = self.get_record_identifier(record)
+    def filter_duplicate_identifiers(self) -> None:
+        """
+        this function identifies duplicates in the harvest source via the
+        record's identifier, checking every record_type independently. it
+        adds a record error about the duplicate to the db and removes the
+        duplicate from processing.
+        """
+        self._filter_duplicate_identifiers_from(self.external_records, "dataset")
+        for record_type, config in NON_DATASET_RECORD_TYPES.items():
+            self._filter_duplicate_identifiers_from(
+                self.external_records_by_type.get(record_type, []),
+                record_type,
+                config["identifier_field"],
+            )
 
-                if self.source_type == "document":
-                    dataset_hash = dataset_to_hash(sort_dataset(record))
+    def filter_waf_files_by_datetime(self) -> None:
+        """
+        retains waf files which need to be created or updated whereby the update
+        is determined via the modified_date found on the waf web page. if the file date
+        at the source is more recent than what we have then we want to add it for processing.
 
+        the number of datasets filtered by datetime is added to the unchanged count of the job
+
+        this function is only called when the harvest source type is "waf" so
+        self.external_records would be a list of dictionaries like...
+        [ { "identifier": "a.xml", "modified_date": datetime_obj}, ... ]
+        """
+        records = []
+        for data in self.external_records:
+            identifier = data["identifier"]
+            internal_record = self.internal_records.get((identifier, "dataset"), None)
+            if internal_record is not None:
+                # date_finished should never be None since we
+                # only grab successful internal records which are datetime stamped
+                if data["modified_date"] > internal_record.date_finished:
+                    records.append(data)  # update
+            else:
+                records.append(data)  # create
+
+        # update unchanged to include filtered waf docs
+        for _ in range(len(self.external_records) - len(records)):
+            self.reporter.update(None)
+
+        self.db_interface.update_harvest_job(self.job_id, self.reporter.report())
+
+        self.external_records = records
+
+    def _filter_records_with_no_identifier(
+        self, records: list, record_type: str, identifier_field: str = "identifier"
+    ) -> list:
+        """
+        identifies and removes records without a harvestable identifier from
+        [records] and logs the error in the db as a record-level error.
+
+        string identifiers are used as-is. object identifiers must provide @id.
+        """
+
+        filtered_records = []
+
+        for record in records:
+            error_identifier = None
+            try:
+                identifier = record.get(identifier_field)
+                if normalize_dataset_identifier(identifier) is None:
+                    # use something identifiable to the dataset otherwise label it accordingly
+                    id_substitute = (
+                        record.get("title")
+                        or record.get("description")
+                        or "no-identifier"
+                    )
+                    record_data = {
+                        "harvest_job_id": self.job_id,
+                        "harvest_source_id": self.id,
+                        "identifier": id_substitute,
+                        "status": "error",
+                        "record_type": record_type,
+                    }
+                    new_record = self.db_interface.add_harvest_record(record_data)
+                    error_identifier = (
+                        new_record.identifier if new_record else id_substitute
+                    )
+                    harvest_record_id = new_record.id if new_record else None
+
+                    raise NoIdentifierException(
+                        f"{self.name} {error_identifier} "
+                        f"{describe_identifier_error(identifier, identifier_field)}",
+                        self.job_id,
+                        harvest_record_id,
+                    )
+                else:
+                    filtered_records.append(record)
+
+            except NoIdentifierException:
+                self.update_job_record_count_by_action("errored")
+                continue
+
+        return filtered_records
+
+    def filter_datasets_with_no_identifier(self) -> None:
+        """
+        identifies and removes datasets without a harvestable identifier from
+        self.external_records, and non-dataset records (DataService,
+        CatalogRecord, ...) without one from self.external_records_by_type,
+        logging each as a record-level error.
+
+        string identifiers are used as-is. object identifiers must provide @id.
+        """
+        self.external_records = self._filter_records_with_no_identifier(
+            self.external_records, "dataset"
+        )
+        for record_type, config in NON_DATASET_RECORD_TYPES.items():
+            self.external_records_by_type[record_type] = (
+                self._filter_records_with_no_identifier(
+                    self.external_records_by_type.get(record_type, []),
+                    record_type,
+                    config["identifier_field"],
+                )
+            )
+
+    def determine_internal_deletions(self) -> None:
+        """
+        determines which records in the harvester db needed to be deleted based on
+        the identifiers of the records. if the db has the record and the harvest source
+        doesn't that means the record needs to be deleted.
+
+        keys are (identifier, record_type) tuples so records of different
+        types sharing an identifier are compared independently.
+        """
+        external_ids = {
+            (normalize_dataset_identifier(record.get("identifier")), "dataset")
+            for record in self.external_records
+        }
+        for record_type, config in NON_DATASET_RECORD_TYPES.items():
+            external_ids |= {
+                (
+                    normalize_dataset_identifier(
+                        record.get(config["identifier_field"])
+                    ),
+                    record_type,
+                )
+                for record in self.external_records_by_type.get(record_type, [])
+            }
+        internal_ids = set(self.internal_records.keys())
+        self.deletions = internal_ids - external_ids
+
+    def iter_internal_records_to_be_deleted(self) -> any:
+        """
+        given a list of records to delete grab the internal Record instance, update
+        the instance action to "delete", write that data to the db and yield it for
+        processing.
+        """
+        for identifier in self.deletions:
+            internal_record = self.internal_records[identifier]
+            internal_record.action = "delete"
+            internal_record.write_compare_to_db()
+            yield internal_record
+
+    def external_records_to_process(self) -> any:
+        """
+        this function prepares the external record for ETVL processing by converting
+        each record into a Record instance by providing the associated harvest source,
+        the record identifier, and record itself, and the hash of the record.
+
+        at the start of the loop the record is either an xml url string (waf) or a
+        json/dict object (datajson). in the case for waf this function downloads
+        the file. in the case for datajson the dict is recursively sorted
+        to ensure accurate hashes across harvests.
+
+        this function yields 1 record at a time to minimize memory usage of large waf sources.
+        it yields 1 record regardless of the source type (e.g. datajson or waf), yielding
+        Dataset records before any non-dataset (DataService, CatalogRecord,
+        ...) records.
+        """
+        while len(self.external_records) > 0:
+            try:
+                record = self.external_records.pop(0)
+                parent_identifier = None
                 if self.source_type == "waf":
-                    dataset_hash = dataset_to_hash(record["content"].decode("utf-8"))
+                    record["content"] = download_file(record["identifier"], ".xml")
+                    dataset = record["content"]
 
-                self.external_records[identifier] = Record(
-                    self, identifier, record, dataset_hash
+                elif self.source_type == "waf-collection":
+                    record["content"] = download_file(record["identifier"], ".xml")
+                    dataset = record["content"]
+                    parent_identifier = self.collection_parent_url
+
+                elif self.source_type == "document":
+                    if self.schema_type.startswith("dcatus"):
+                        parent_identifier = record.pop("parent_identifier", None)
+                        dataset = json.dumps(sort_dataset(record))
+                    elif self.schema_type.startswith("iso19115"):
+                        # single document ISO
+                        record["content"] = download_file(record["identifier"], ".xml")
+                        dataset = record["content"]
+
+                dataset_hash = dataset_to_hash(dataset)
+                identifier = normalize_dataset_identifier(record.get("identifier"))
+
+                yield Record(
+                    self,
+                    identifier,
+                    dataset,
+                    dataset_hash,
+                    _parent_identifier=parent_identifier,
                 )
+
+                del record
             except Exception as e:
-                # TODO: do something with 'e'
-                raise ExtractExternalException(
-                    f"{self.title} {self.url} failed to convert to id:hash",
+                self.update_job_record_count_by_action("errored")
+
+                # "record"s in self.external_records are standardized as dicts at this point
+                record_id = normalize_dataset_identifier(record.get("identifier"))
+
+                ExternalRecordToClass(
+                    f"{self.name} {record_id} failed to prepare record for harvest :: {repr(e)}",
                     self.job_id,
+                    None,  # there is no record id to associate
                 )
 
-    def prepare_internal_data(self) -> None:
+        for record_type, config in NON_DATASET_RECORD_TYPES.items():
+            records = self.external_records_by_type.get(record_type, [])
+            identifier_field = config["identifier_field"]
+            while len(records) > 0:
+                try:
+                    record = records.pop(0)
+                    serialized = json.dumps(sort_dataset(record))
+                    record_hash = dataset_to_hash(serialized)
+                    identifier = normalize_dataset_identifier(
+                        record.get(identifier_field)
+                    )
+
+                    yield Record(
+                        self,
+                        identifier,
+                        serialized,
+                        record_hash,
+                        _record_type=record_type,
+                    )
+
+                    del record
+                except Exception as e:
+                    self.update_job_record_count_by_action("errored")
+
+                    record_id = normalize_dataset_identifier(
+                        record.get(identifier_field)
+                    )
+
+                    ExternalRecordToClass(
+                        f"{self.name} {record_id} failed to prepare record for harvest :: {repr(e)}",
+                        self.job_id,
+                        None,  # there is no record id to associate
+                    )
+
+    def acquire_minimum_external_data(self) -> list:
+        """
+        this function either downloads the datajson file or gathers all the waf files
+        to be downloaded later. self.external_records is a list of dicts. for waf,
+        the dict has a similar "schema" to dcatus for standardization across this app.
+
+        "minimum" means the least we need to move forward with
+        harvesting. if the minimum can't be met then we throw a critical exception.
+        """
+        logger.info("retrieving external records.")
+        try:
+            if self.source_type == "document":
+                if self.schema_type.startswith("dcatus"):
+                    catalog = download_file(self.url, ".json")
+
+                    if self.schema_type == "dcatus3.0":
+                        self.external_records_by_type = {
+                            record_type: config["extractor"](catalog)
+                            for record_type, config in NON_DATASET_RECORD_TYPES.items()
+                        }
+                        self.external_records = (
+                            extract_dcatus3_catalog_datasets(catalog)
+                            + extract_dcatus3_nested_datasets(
+                                self.external_records_by_type.get("data_service", []),
+                                "servesDataset",
+                                parent_identifier_field=NON_DATASET_RECORD_TYPES[
+                                    "data_service"
+                                ]["identifier_field"],
+                            )
+                            + extract_dcatus3_nested_datasets(
+                                self.external_records_by_type.get("data_series", []),
+                                "seriesMember",
+                                "first",
+                                "last",
+                                parent_identifier_field=NON_DATASET_RECORD_TYPES[
+                                    "data_series"
+                                ]["identifier_field"],
+                            )
+                        )
+                        self.db_interface.update_harvest_job(
+                            self.job_id,
+                            {"dcatus_catalog": strip_dcatus3_catalog_objects(catalog)},
+                        )
+                    else:
+                        self.external_records = catalog["dataset"]
+                elif self.schema_type.startswith("iso19115"):
+                    # mimic the output of traverse_waf with a single file
+                    self.external_records = [{"identifier": self.url}]
+                else:
+                    raise ValueError(f"Schema type {self.schema_type} is not supported")
+
+            elif self.source_type == "waf":
+                self.external_records = traverse_waf(self.url)
+
+            elif self.source_type == "waf-collection":
+                # First element is just like a single document waf, but we
+                # don't have a datetime for it, so use the ancient placeholder
+                self.external_records = [
+                    {
+                        "identifier": self.collection_parent_url,
+                        "modified_date": DT_PLACEHOLDER,
+                    }
+                ]
+                self.external_records += traverse_waf(self.url)
+
+        except Exception as e:
+            # ruff: noqa: E501
+            raise ExtractExternalException(
+                f"{self.name} {self.url} failed to extract harvest source. exiting :: {repr(e)}",
+                self.job_id,
+            )
+
+    def acquire_data_sources(self) -> None:
+        """
+        retrieves external (harvest source) and internal (harvester db) data sources
+        """
+        self.acquire_minimum_internal_data()
+
+        if self.job_type == "clear":
+            self.external_records = []
+            self.external_records_by_type = {}
+        else:
+            self.acquire_minimum_external_data()
+
+    def acquire_minimum_internal_data(self) -> None:
+        """
+        this function retrieves the latest set of records for the given harvest source
+        and converts them into Record instances. these records don't contain the original
+        raw source because the app doesn't need it and by excluding it the app uses
+        less memory.
+        """
         logger.info("retrieving and preparing internal records.")
         try:
             records = self.db_interface.get_latest_harvest_records_by_source(self.id)
-            self.internal_records_to_id_hash(records)
+            self.store_records_as_internal(records)
         except Exception as e:
+            # ruff: noqa: E501
             raise ExtractInternalException(
-                f"{self.name} {self.url} failed to extract internal records. exiting",
+                f"{self.name} {self.url} failed to extract internal records. exiting :: {repr(e)}",
                 self.job_id,
             )
 
-    def prepare_external_data(self) -> None:
-        logger.info("retrieving and preparing external records.")
+    def run_full_harvest(self) -> None:
         try:
-            if self.source_type == "document":
-                self.external_records_to_id_hash(
-                    download_file(self.url, ".json")["dataset"]
+            self.acquire_data_sources()
+
+            self.filter_datasets_with_no_identifier()
+
+            self.determine_internal_deletions()
+            internal_records_to_delete = self.iter_internal_records_to_be_deleted()
+
+            if (
+                self.source_type in ["waf", "waf-collection"]
+                and self.job_type != "force_harvest"
+            ):
+                self.filter_waf_files_by_datetime()
+
+            self.filter_duplicate_identifiers()
+
+            external_records_to_process = self.external_records_to_process()
+
+            # amount of work to be done. Some filters record errors/ignored records
+            # before this point, so include work already counted by the reporter.
+            self.reporter.total = (
+                self.reporter.processed_count
+                + len(self.deletions)
+                + len(self.external_records)
+                + sum(
+                    len(records) for records in self.external_records_by_type.values()
                 )
-            if self.source_type == "waf":
-                # TODO
-                self.external_records_to_id_hash(download_waf(traverse_waf(self.url)))
-        except Exception as e:
-            raise ExtractExternalException(
-                f"{self.name} {self.url} failed to extract harvest source. exiting",
-                self.job_id,
             )
 
-    def compare(self) -> None:
-        """Compares records"""
-        # ruff: noqa: F841
-        logger.info("comparing our records with theirs")
+            # deletions would occur first based on the arg positions
+            records = chain(internal_records_to_delete, external_records_to_process)
 
-        try:
-            external_ids = IndexedSet(self.external_records.keys())
-            internal_ids = IndexedSet(self.internal_records.keys())
-            same_ids = external_ids & internal_ids
+            for record in records:
+                record.harvest()
+                del record
+                gc.collect()
 
-            self.compare_data["delete"] = internal_ids - external_ids
-            self.compare_data["create"] = external_ids - internal_ids
+        except (ExtractInternalException, ExtractExternalException):
+            self.finish_job_with_status("error")
+            return
 
-            for i in same_ids:
-                external_hash = self.external_records[i].metadata_hash
-                internal_hash = self.internal_records[i].metadata_hash
-                if external_hash != internal_hash:
-                    self.compare_data["update"].add(i)
-        except Exception as e:
-            # TODO: do something with 'e'
-            raise CompareException(
-                f"{self.title} {self.url} failed to run compare. exiting.",
-                self.job_id,
-            )
-
-    def get_record_changes(self) -> None:
-        """determine which records needs to be updated, deleted, or created"""
-        logger.info(f"getting records changes for {self.name} using {self.url}")
-        self.prepare_external_data()
-        self.prepare_internal_data()
-        self.compare()
-
-    def write_compare_to_db(self) -> dict:
-        records = []
-
-        for action, ids in self.compare_data.items():
-            for record_id in ids:
-                if action == "delete":
-                    record = self.internal_records[record_id]
-                else:
-                    record = self.external_records[record_id]
-
-                if self.schema_type.startswith("dcatus"):
-                    source_raw = json.dumps(record.metadata)
-                else:
-                    source_raw = record.metadata["content"]
-
-                records.append(
-                    {
-                        "identifier": record.identifier,
-                        "harvest_job_id": record.harvest_source.job_id,
-                        "harvest_source_id": record.harvest_source.id,
-                        "source_hash": record.metadata_hash,
-                        "source_raw": source_raw,
-                        "action": action,
-                        "ckan_id": record.ckan_id,
-                        "ckan_name": record.ckan_name,
-                    }
-                )
-        self.internal_records_lookup_table = self.db_interface.add_harvest_records(
-            records
-        )
-
-    def synchronize_records(self) -> None:
-        """runs the delete, update, and create
-        - self.compare can be empty because there was no harvest source response
-        or there's truly nothing to process
+    def finish_job_with_status(self, status: str):
         """
-        logger.info("synchronizing records")
-        for action, ids in self.compare_data.items():
-            for i in ids:
-                try:
-                    if action == "delete":
-                        # we don't actually create a Record instance for deletions
-                        # so creating it here as a sort of acknowledgement
-                        self.external_records[i] = Record(
-                            self,
-                            self.internal_records[i].identifier,
-                            _ckan_id=self.internal_records[i].ckan_id,
-                        )
-                        self.external_records[i].action = action
-                        try:
-                            self.external_records[i].delete_record()
-                            self.external_records[i].update_self_in_db()
-                        except Exception as e:
-                            self.external_records[i].status = "error"
-                            raise SynchronizeException(
-                                f"failed to {self.external_records[i].action} \
-                                    for {self.external_records[i].identifier} :: \
-                                        {repr(e)}",
-                                self.job_id,
-                                self.internal_records_lookup_table[
-                                    self.external_records[i].identifier
-                                ],
-                            )
-                        continue
-
-                    record = self.external_records[i]
-                    if action == "update":
-                        record.ckan_id = self.internal_records[i].ckan_id
-                        record.ckan_name = self.internal_records[i].ckan_name
-
-                    # no longer setting action in compare so setting it here...
-                    record.action = action
-
-                    if not self.schema_type.startswith("dcatus"):
-                        record.transform()
-                    record.validate()
-                    record.sync()
-
-                except (
-                    ValidationException,
-                    DCATUSToCKANException,
-                    SynchronizeException,
-                    TransformationException,
-                ) as e:
-                    pass
+        update the job record in the db with the provided status and set
+        date_finished. date_finished is set here because this function is
+        either called on critical exception or the job has completed harvesting.
+        """
+        self.db_interface.update_harvest_job(
+            self.job_id, {"status": status, "date_finished": get_datetime()}
+        )
 
     def report(self) -> None:
-        logger.info("report results")
-        # log our original compare data
-        logger.info("expected actions to be done")
-        logger.info({action: len(ids) for action, ids in self.compare_data.items()})
+        """Assemble and record report for harvest job"""
 
-        # validation count and actual results
-        actual_results_action = {
-            "delete": 0,
-            "update": 0,
-            "create": 0,
-            None: 0,
-        }
-        actual_results_status = {"success": 0, "error": 0, None: 0}
-        validity = {"valid": 0, "invalid": 0, "ignored": 0}
+        job_results = self.reporter.report()
 
-        for record_id, record in self.external_records.items():
-            # action
-            if record.status != "error":
-                actual_results_action[record.action] += 1
-            # status
-            actual_results_status[record.status] += 1
-            # validity
-            if record.valid:
-                validity["valid"] += 1
-            elif not record.valid:
-                validity["invalid"] += 1
-            else:
-                validity["not_validated"] += 1
+        if self.job_type == "clear" and self.clear_complete is False:
+            ClearJobException(
+                f"{self.name} failed to clear completely",
+                self.job_id,
+            )
 
-        # what actually happened?
-        logger.info("actual actions completed")
-        logger.info(actual_results_action)
-
-        # what actually happened?
-        logger.info("actual status completed")
-        logger.info(actual_results_status)
-
-        # what's our record validity count?
-        logger.info("validity of the records")
-        logger.info(validity)
-
-        job_status = {
-            "status": "complete",
-            "date_finished": datetime.now(timezone.utc),
-            "records_added": actual_results_action["create"],
-            "records_updated": actual_results_action["update"],
-            "records_deleted": actual_results_action["delete"],
-            "records_ignored": actual_results_action[None],
-            "records_errored": actual_results_status["error"],
-        }
-        self.db_interface.update_harvest_job(self.job_id, job_status)
+        # only label the job as "complete" if it hasn't errored out by now
+        job = self.db_interface.get_harvest_job(self.job_id)
+        if job.status != "error":
+            job_status = {"status": "complete", "date_finished": get_datetime()}
+            job_status.update(job_results)
+            self.db_interface.update_harvest_job(self.job_id, job_status)
 
         if hasattr(self, "notification_emails") and self.notification_emails:
-            self.send_notification_emails(actual_results_action)
+            if (
+                self.notification_frequency == "always"
+                or (
+                    self.notification_frequency == "on_error"
+                    and job_results["records_errored"]
+                )
+                or (
+                    self.notification_frequency == "on_error_or_update"
+                    and (
+                        job_results["records_errored"] or job_results["records_updated"]
+                    )
+                )
+            ):
+                try:
+                    self.send_notification_emails(job_results)
+                except SendNotificationException as e:
+                    logging.error(
+                        f"Error sending notification emails for job {self.job_id}: {e}"
+                    )
 
-    def send_notification_emails(self, results: dict) -> None:
-        job_url = f'{SMTP_CONFIG["base_url"]}/harvest_job/{self.job_id}'
-
-        subject = "Harvest Job Completed"
-        body = (
-            f"The harvest job ({self.job_id}) has been successfully completed.\n"
-            f"You can view the details here: {job_url}\n\n"
-            "Summary of the job:\n"
-            f"- Records Added: {results['create']}\n"
-            f"- Records Updated: {results['update']}\n"
-            f"- Records Deleted: {results['delete']}\n"
-            f"- Records Ignored: {results[None]}\n\n"
-            "====\n"
-            "You received this email because you subscribed to harvester updates.\n"
-            "Please do not reply to this email, as it is not monitored."
-        )
-        support_recipient = SMTP_CONFIG.get("recipient")
-        user_recipients = self.notification_emails
-        all_recipients = [support_recipient] + user_recipients
-
-        msg = MIMEMultipart()
-        msg["From"] = SMTP_CONFIG["default_sender"]
-        msg["Reply-To"] = "datagov-noreply@gsa.gov"
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
-
+    def send_notification_emails(self, job_results: dict) -> None:
+        """Send harvest report emails to havest source POCs"""
         try:
-            with smtplib.SMTP(SMTP_CONFIG["server"], SMTP_CONFIG["port"]) as server:
-                if SMTP_CONFIG["use_tls"]:
-                    server.starttls()
-                server.login(SMTP_CONFIG["username"], SMTP_CONFIG["password"])
+            job_url = f"{SMTP_CONFIG['base_url']}/harvest_job/{self.job_id}"
 
-                for recipient in all_recipients:
-                    msg["To"] = recipient
-                    server.sendmail(SMTP_CONFIG["default_sender"], [recipient],
-                                    msg.as_string())
-                    logger.info(f"Notification email sent to: {recipient}")
+            subject = "Harvest Job Completed"
+            source = self.get_source_orm()
+            org_name = source.org.name
+
+            body = (
+                "A harvest job has been successfully completed.\n"
+                f"- Organization: {org_name}\n"
+                f"- Harvest source: {self.name}\n"
+                f"- Job details: {job_url}\n\n"
+                f"Summary of the job ({self.job_id}):\n"
+                f"- Records Added: {job_results['records_added']}\n"
+                f"- Records Updated: {job_results['records_updated']}\n"
+                f"- Records Deleted: {job_results['records_deleted']}\n"
+                f"- Records Unchanged: {job_results['records_ignored']}\n"
+                f"- Records Errored: {job_results['records_errored']}\n"
+                f"- Records Warned: {job_results['records_warned']}\n"
+                f"- Records Validated: {job_results['records_validated']}\n\n"
+                "====\n"
+                "You received this email because you subscribed to harvester updates.\n"
+                "Please do not reply to this email, as it is not monitored."
+            )
+            support_recipient = SMTP_CONFIG.get("recipient")
+            user_recipients = self.notification_emails
+            all_recipients = [support_recipient] + user_recipients
+
+            send_email_to_recipients(all_recipients, subject, body)
+
         except Exception as e:
-            logger.error(f"Failed to send notification email: {e}")
+            logger.error(f"Error preparing or sending notification emails: {e}")
+            raise SendNotificationException(
+                f"Error preparing or sending notification emails for job {self.job_id}: {e}",
+                self.job_id,
+            )
 
 
 @dataclass
@@ -448,24 +892,25 @@ class Record:
 
     _harvest_source: HarvestSource
     _identifier: str
-    _metadata: dict = field(default_factory=lambda: {})
+    _source_raw: str = None
     _metadata_hash: str = ""
     _action: str = None
-    _valid: bool = None
-    _validation_msg: str = ""
     _status: str = None
     _ckan_id: str = None
-    _ckan_name: str = None
+    _dataset_slug: str = None
+    _date_finished: str = None
     _mdt_writer: str = "dcat_us"
     _mdt_msgs: str = ""
+    _id: str = None
+    _parent_identifier: str = None
+    _record_type: str = "dataset"
 
     transformed_data: dict = None
     ckanified_metadata: dict = field(default_factory=lambda: {})
     reader_map: dict = field(
         default_factory=lambda: {
-            "iso19115_1": "iso19115_1",
+            "iso19115_1": "iso19115_2_datagov",
             "iso19115_2": "iso19115_2_datagov",
-            "csdgm": "fgdc",
         }
     )
 
@@ -490,12 +935,24 @@ class Record:
         self._ckan_id = value
 
     @property
-    def ckan_name(self) -> str:
-        return self._ckan_name
+    def id(self) -> str:
+        return self._id
 
-    @ckan_name.setter
-    def ckan_name(self, value) -> None:
-        self._ckan_name = value
+    @id.setter
+    def id(self, value) -> None:
+        self._id = value
+
+    @property
+    def dataset_slug(self) -> str:
+        return self._dataset_slug
+
+    @dataset_slug.setter
+    def dataset_slug(self, value) -> None:
+        self._dataset_slug = value
+
+    @property
+    def date_finished(self) -> str:
+        return self._date_finished
 
     @property
     def mdt_writer(self) -> str:
@@ -516,8 +973,16 @@ class Record:
         return self._identifier
 
     @property
-    def metadata(self) -> dict:
-        return self._metadata
+    def parent_identifier(self) -> str:
+        return self._parent_identifier
+
+    @property
+    def record_type(self) -> str:
+        return self._record_type
+
+    @property
+    def source_raw(self) -> str:
+        return self._source_raw
 
     @property
     def metadata_hash(self) -> str:
@@ -534,26 +999,6 @@ class Record:
         self._action = value
 
     @property
-    def valid(self) -> bool:
-        return self._valid
-
-    @valid.setter
-    def valid(self, value) -> None:
-        if not isinstance(value, bool):
-            raise ValueError("Record validity must be expressed as a boolean")
-        self._valid = value
-
-    @property
-    def validation_msg(self) -> str:
-        return self._validation_msg
-
-    @validation_msg.setter
-    def validation_msg(self, value) -> None:
-        if not isinstance(value, str):
-            raise ValueError("status must be a string")
-        self._validation_msg = value
-
-    @property
     def status(self) -> None:
         return self._status
 
@@ -563,141 +1008,594 @@ class Record:
             raise ValueError("status must be a string")
         self._status = value
 
-    def transform(self) -> None:
+    @staticmethod
+    def _is_valid_url(url: str) -> bool:
+        """Return whether a string is a valid URL."""
+        return Draft202012Validator(
+            {"type": "string", "format": "uri"},
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        ).is_valid(url)
 
+    def is_valid_describedByType(self, described_by_type: str) -> bool:
+        """Return whether a string is a valid describedByType."""
+
+        return Draft202012Validator(
+            self.harvest_source.dataset_schema["properties"]["describedByType"],
+            format_checker=FormatChecker(),
+        ).is_valid(described_by_type)
+
+    def harvest(self) -> None:
+        """
+        this is the main harvest function for a record instance. it runs the compare,
+        transform (when needed), DCATUS v1.1 validation, and synchronization with ckan. this process
+        handles the create, update, delete, and do-nothing (just skips).
+        """
+        try:
+            if self.action == "delete":
+                synched_with_ckan = self.sync()
+                if (
+                    self.harvest_source.job_type == "clear"
+                    and synched_with_ckan is False
+                ):
+                    self.harvest_source.clear_complete = False
+                return
+            self.compare()
+            if self.action is None:
+                return
+            if self.harvest_source.schema_type.startswith("iso19115"):
+                self.transform()
+                self.add_parent()
+                self.replace_identifier()
+                self.fill_placeholders()
+                self.improve_distributions()
+                self._save_transformed_data()
+            self.validate()
+            self.sync()
+        except (
+            CompareException,
+            TransformationException,
+        ):
+            pass
+
+    def compare(self) -> None:
+        """
+        this function determines the work (or lack of work) needing to be
+        done on the record instance. the work is either create, update, or
+        None. None means the record is synchronized with the source and nothing
+        needs to be done. we have the latest state of the record.
+        """
+        internal_record = self.harvest_source.internal_records.get(
+            (self.identifier, self.record_type), None
+        )
+
+        if internal_record is not None:
+            not_same_hash = internal_record.metadata_hash != self.metadata_hash
+            # TODO: should a force-harvest be an update or a create?
+            if not_same_hash or self.harvest_source.job_type == "force_harvest":
+                self.action = "update"
+                self.ckan_id = internal_record.ckan_id
+                self.dataset_slug = internal_record.dataset_slug
+        else:
+            self.action = "create"
+
+        if self.action is not None:
+            self.write_compare_to_db()
+        else:
+            self.harvest_source.update_job_record_count_by_action(None)
+
+    def write_compare_to_db(self) -> None:
+        try:
+            record_mapping = make_record_mapping(self)
+            db_record = self.harvest_source.db_interface.add_harvest_record(
+                record_mapping
+            )
+            self.id = db_record.id
+        except Exception as e:
+            raise CompareException(
+                f"{self.harvest_source.name} {self.harvest_source.url} failed to write compare to db. :: {repr(e)}",
+                self.harvest_source.job_id,
+            )
+
+    def transform(self) -> None:
         data = {
-            "file": self.metadata["content"],
+            "file": self.source_raw,
             "reader": self.reader_map[self.harvest_source.schema_type],
             "writer": self.mdt_writer,
         }
 
         mdt_url = os.getenv("MDTRANSLATOR_URL")
-        resp = requests.post(mdt_url, json=data)
-        data = resp.json()
+        try:
+            resp = requests.post(mdt_url, json=data, headers={"User-Agent": USER_AGENT})
+            # this will raise an HTTPError for bad responses (4xx, 5xx)
+            # so we can handle them in the except block, we also will have
+            # access to the response object
+            resp.raise_for_status()
+            if 200 <= resp.status_code < 300:
+                data = resp.json()
+                logger.info(
+                    f"successfully transformed record: {self.identifier} db id: {self.id}"
+                )
+                self.transformed_data = json.loads(data["writerOutput"])
 
-        if resp.status_code == 422:
-            self.mdt_msgs = prepare_transform_msg(data)
+        except HTTPError as err:
+            logger.error("Error: %s - Status Code: %s", err, resp.status_code)
+            if resp.status_code == 422:
+                data = resp.json()
+                self.mdt_msgs = prepare_transform_msg(data)
+                self.status = "error"
+                self.harvest_source.update_job_record_count_by_action("errored")
+                raise TransformationException(
+                    f"record failed to transform: {self.mdt_msgs}",
+                    self.harvest_source.job_id,
+                    self.id,
+                )
+            else:
+                self.status = "error"
+                self.harvest_source.update_job_record_count_by_action("errored")
+                raise TransformationException(
+                    f"record failed to transform because of unexpected status code: {resp.status_code}",
+                    self.harvest_source.job_id,
+                    self.id,
+                )
+
+        except Timeout:
+            logger.error("Request timed out")
+            self.status = "error"
+            self.harvest_source.update_job_record_count_by_action("errored")
             raise TransformationException(
-                f"record failed to transform: {self.mdt_msgs}",
+                "record failed to transform due to request timeout",
                 self.harvest_source.job_id,
-                self.harvest_source.internal_records_lookup_table[self.identifier],
+                self.id,
             )
 
-        if 200 <= resp.status_code < 300:
-            self.transformed_data = json.loads(data["writerOutput"])
+        except Exception as err:
+            logger.info("Unexpected error: %s", err)
+            self.status = "error"
+            self.harvest_source.update_job_record_count_by_action("errored")
+            raise TransformationException(
+                f"record failed to transform with error: {err}",
+                self.harvest_source.job_id,
+                self.id,
+            )
+
+    def replace_identifier(self) -> None:
+        """
+        mdtranslator can derive an 'identifier' field from ISO docs but we don't
+        want that. we want the URL as the identifier.
+        """
+        self.transformed_data["identifier"] = self.identifier
+
+    def add_parent(self) -> None:
+        """Add parent information to transformed_data for waf-collections.
+
+        mdtranslator can derive 'isPartOf' but we want to prioritize
+        self.parent_identifier when available
+        """
+        if self.parent_identifier:
+            self.transformed_data["isPartOf"] = self.parent_identifier
+
+    def add_geospatial(self) -> None:
+        """
+        adds the term "geospatial" in the "theme" array when not present
+        """
+        if not self.transformed_data.get("theme"):
+            self.transformed_data["theme"] = ["geospatial"]
+        else:
+            has_spatial_theme = any(
+                label.strip().lower() == "geospatial"
+                for label in self.transformed_data["theme"]
+            )
+            if not has_spatial_theme:
+                self.transformed_data["theme"].append("geospatial")
+
+    def fill_placeholders(self) -> None:
+        """Fill in placeholder values to prevent some validation errors.
+
+        We work directly on the self.transformed_data dict.
+        """
+        # missing contactPoint or it's empty
+        if not self.transformed_data.get("contactPoint"):
+            self.transformed_data["contactPoint"] = {
+                "fn": "Not provided - Contact data.gov",
+                "hasEmail": "mailto:datagovsupport@gsa.gov",
+            }
+
+        if not self.transformed_data.get("description"):
+            self.transformed_data["description"] = "No description was provided."
+
+        if not self.transformed_data.get("keyword"):
+            self.transformed_data["keyword"] = ["__"]
+
+        if not self.transformed_data.get("publisher"):
+            # publisher defaults to the harvest source's organization
+            # information
+            self.transformed_data["publisher"] = {
+                "name": self.harvest_source.get_source_orm().org.name
+            }
+
+        if not self.is_valid_describedByType(
+            self.transformed_data.get("describedByType", "")
+        ):
+            self.transformed_data["describedByType"] = "application/octet-steam"
+
+        # If distribution items have a downloadURL or accessURL,
+        # check if it just needs an "https://" at the beginning
+        # to be valid
+        def _guess_better_url_in_item(item, key):
+            url = item.get(key)
+            if url is not None and not self._is_valid_url(url):
+                # it exists and isn't valid
+                candidate = "https://" + url
+                if self._is_valid_url(candidate):
+                    # TODO: log a warning that we are making this change
+                    item[key] = candidate
+
+        for dist_item in self.transformed_data.get("distribution", []):
+            _guess_better_url_in_item(dist_item, "downloadURL")
+            _guess_better_url_in_item(dist_item, "accessURL")
+            if not self.is_valid_describedByType(dist_item.get("describedByType", "")):
+                dist_item["describedByType"] = "application/octet-stream"
+
+        # add geospatial placeholder for ISO records
+        self.add_geospatial()
+
+    def improve_distributions(self) -> None:
+        """
+        calculate mediatype and adding landing page as distribution when available
+        """
+        self.transformed_data = prepare_distributions(self.transformed_data)
+
+    def _save_transformed_data(self) -> None:
+        if self.transformed_data is None or self.id is None:
+            return
+
+        try:
+            self.harvest_source.db_interface.update_harvest_record(
+                self.id,
+                {"source_transform": self.transformed_data},
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to persist source_transform for record %s: %s",
+                self.id,
+                repr(e),
+            )
+
+    def _report_error(self, e):
+        """Report an exception to the database.
+
+        This does not re-raise the exception, it logs it and
+        execution proceeds. If callers want to raise, they need
+        to `raise e` after calling this method.
+        """
+
+        e_msg = re.sub(r"\\+", r"\\", repr(e))
+
+        self.status = "error"
+        log_non_critical_error(
+            e_msg,
+            self.harvest_source.job_id,
+            self.id,
+            e.__class__.__name__,
+            emit_log=False,
+        )
+
+    def _report_warning(self, warning: DcatWarning) -> None:
+        """Persist a DCAT-US 3 content-quality warning.
+
+        Unlike _report_error, this never changes the record's status: a
+        warning is not a failure and must not clobber an errored (or
+        successful) record's status.
+        """
+        log_non_critical_error(
+            warning.message,
+            self.harvest_source.job_id,
+            self.id,
+            warning.warning_type,
+            is_error=False,
+            emit_log=False,
+            severity="warning",
+        )
 
     def validate(self) -> None:
+        """Validate a single record.
+
+        Run our jsconschema validator against the raw JSON record or the
+        transformed JSON data.
+
+        Returns True if the record is valid, False if it is not.
+        """
+        # TODO: create a different status for transformation exceptions
+        # so they aren't confused with validation issues
         logger.info(f"validating {self.identifier}")
-        # ruff: noqa: F841
-        validator = Draft202012Validator(self.harvest_source.dataset_schema)
-        try:
-            record = (
-                self.metadata
-                if self.transformed_data is None
-                else self.transformed_data
+        if self.transformed_data is None:
+            try:
+                record = json.loads(self.source_raw)
+            except json.JSONDecodeError as e:
+                self._report_error(e)
+                self.harvest_source.update_job_record_count_by_action("errored")
+                return False
+        else:
+            record = self.transformed_data
+
+        # save ourselves a second call to is_valid by keeping a flag of
+        # whether we saw any errors
+        valid = True
+
+        validator = self.harvest_source.validator_for(self.record_type)
+        errors = validator.iter_errors(record)
+        errors = assemble_validation_errors(errors)
+        for error in errors:
+            valid = False
+            self._report_error(error)
+
+        # DCAT-US 3 content-quality warnings are detected regardless of schema
+        # validity and never change the record's status. A record can be both
+        # validated (or errored) and warned.
+        if self.harvest_source.schema_type == "dcatus3.0":
+            warnings = detect_dcat_warnings(record)
+            for warning in warnings:
+                self._report_warning(warning)
+            if warnings:
+                self.harvest_source.update_job_record_count_by_action("warned")
+
+        if valid:
+            self.harvest_source.update_job_record_count_by_action("validated")
+            return True
+        else:
+            # update the reporter only once even with multiple errors
+            self.harvest_source.update_job_record_count_by_action("errored")
+            return False
+
+    def _metadata_for_dataset(self):
+        if self.transformed_data is not None:
+            return self.transformed_data
+
+        if self.source_raw is None:
+            raise ValueError("Record missing source_raw for dataset persistence")
+
+        return json.loads(self.source_raw)
+
+    def _dataset_payload(self, metadata: dict) -> dict:
+        if not self.dataset_slug:
+            raise ValueError("Record slug is not set for dataset persistence")
+
+        if self.date_finished is None:
+            raise ValueError(
+                "Record date_finished is not set; cannot build dataset payload"
             )
-            validator.validate(record)
-            self.valid = True
-        except Exception as e:
-            self.status = "error"
-            self.validation_msg = str(e)  # TODO: verify this is what we want
-            self.valid = False
-            raise ValidationException(
-                repr(e),
-                self.harvest_source.job_id,
-                self.harvest_source.internal_records_lookup_table[self.identifier],
-            )
 
-    def create_record(self, retry=False):
-        from harvester.utils.ckan_utils import add_uuid_to_package_name
-
-        try:
-            result = ckan.action.package_create(**self.ckanified_metadata)
-            self.ckan_id = result["id"]
-            self.ckan_name = self.ckanified_metadata["name"]
-        except Exception as e:
-            if retry is False:
-                self.ckanified_metadata["name"] = add_uuid_to_package_name(
-                    self.ckanified_metadata["name"]
-                )
-                self.ckan_name = self.ckanified_metadata["name"]
-                return self.create_record(retry=True)
-            else:
-                raise e
-                # will be caught by outer SynchronizeException
-
-    def update_record(self) -> dict:
-        updated_metadata = {
-            **self.ckanified_metadata,
-            **{"id": self.ckan_id, "name": self.ckan_name},
+        payload = {
+            "slug": self.dataset_slug,
+            "dcat": metadata,
+            "organization_id": self.harvest_source.organization_id,
+            "harvest_source_id": self.harvest_source.id,
+            "harvest_record_id": self.id,
+            "last_harvested_date": self.date_finished,
         }
-        ckan.action.package_update(**updated_metadata)
 
-    def delete_record(self) -> None:
-        ckan.action.dataset_purge(**{"id": self.ckan_id})
+        translated_spatial = translate_spatial_to_geojson(metadata.get("spatial"))
+        try:
+            if translated_spatial is not None:
+                payload["translated_spatial"] = translated_spatial
+            if metadata.get("spatial") and translated_spatial is None:
+                raise SpatialTransformationException(
+                    f"unable to spatially fix {metadata.get('spatial')}",
+                    self.harvest_source.job_id,
+                    self.id,
+                    is_error=False,
+                    severity="warning",
+                )
+        except SpatialTransformationException:
+            self.harvest_source.update_job_record_count_by_action("warned")
+            pass
+
+        return payload
+
+    def _index_dataset_in_opensearch(self, dataset) -> None:
+        client = self.harvest_source.opensearch
+        if client is None or dataset is None:
+            return
+        try:
+            succeeded, failed, errors = client.index_datasets([dataset])
+            if failed:
+                logger.error(
+                    "OpenSearch indexing failed for dataset %s (slug %s): %s",
+                    dataset.id,
+                    dataset.slug,
+                    errors,
+                )
+        except Exception as e:
+            logger.exception(
+                "OpenSearch indexing error for dataset %s (slug %s): %s",
+                dataset.id,
+                dataset.slug,
+                e,
+            )
+
+    def _delete_dataset_from_opensearch(self, dataset) -> None:
+        client = self.harvest_source.opensearch
+        if client is None or dataset is None:
+            return
+        try:
+            client.delete_dataset_by_id(dataset.id)
+        except Exception as e:
+            logger.exception(
+                "OpenSearch delete error for dataset %s (slug %s): %s",
+                dataset.id,
+                dataset.slug,
+                e,
+            )
+
+    def sync(self):
+        try:
+            if self.status == "error":
+                return False
+
+            if self.record_type != "dataset":
+                # no downstream table for non-dataset records yet; persist
+                # as a HarvestRecord only.
+                self.status = "success"
+                self.harvest_source.update_job_record_count_by_action(self.action)
+                self.update_self_in_db()
+                return True
+
+            metadata = None
+            if self.action in ("create", "update"):
+                metadata = self._metadata_for_dataset()
+                if not self.dataset_slug:
+                    self.dataset_slug = munge_title_to_name(metadata["title"])
+
+            self.status = "dataset_pending"
+            self.harvest_source.update_job_record_count_by_action(self.action)
+            self.update_self_in_db()
+
+            if self.action in ("create", "update") and metadata is not None:
+                dataset_payload = self._dataset_payload(metadata)
+                if self.action == "create":
+                    dataset = self._insert_dataset_with_unique_slug(dataset_payload)
+                else:
+                    # harvester should never update the slug
+                    update_payload = {
+                        k: v for k, v in dataset_payload.items() if k != "slug"
+                    }
+                    update_payload["slug"] = self.dataset_slug
+                    dataset = self.harvest_source.db_interface.upsert_dataset(
+                        update_payload
+                    )
+                if dataset:
+                    self.status = "success"
+                self._index_dataset_in_opensearch(dataset)
+            elif self.action == "delete" and self.dataset_slug:
+                dataset = self.harvest_source.db_interface.get_dataset_by_slug(
+                    self.dataset_slug
+                )
+                deleted = self.harvest_source.db_interface.delete_dataset_by_slug(
+                    self.dataset_slug
+                )
+                if deleted:
+                    self.status = "success"
+                    self._delete_dataset_from_opensearch(dataset)
+
+            self.update_self_in_db()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"error syncing record: {e}")
+            self.status = "error"
+            self.harvest_source.update_job_record_count_by_action("errored")
+
+        return False
 
     def update_self_in_db(self) -> bool:
-        self.status = "success"
-        data = {"status": "success", "date_finished": datetime.now(timezone.utc)}
+        # set date_finished if it hasn't been set yet
+        if not self._date_finished:
+            self._date_finished = get_datetime()
+
+        data = {
+            "status": self.status,
+            "date_finished": self._date_finished,
+        }
         if self.ckan_id is not None:
             data["ckan_id"] = self.ckan_id
-        if self.ckan_name is not None:
-            data["ckan_name"] = self.ckan_name
+
+        if self.harvest_source.job_type == "force_harvest":
+            data["harvest_job_id"] = self.harvest_source.job_id
 
         self.harvest_source.db_interface.update_harvest_record(
-            self.harvest_source.internal_records_lookup_table[self.identifier],
+            self.id,
             data,
         )
 
-    def ckanify_dcatus(self) -> None:
-        from harvester.utils.ckan_utils import ckanify_dcatus
+    def _insert_dataset_with_unique_slug(self, dataset_payload: dict) -> object:
+        """Persist a dataset, retrying with a unique slug when needed."""
 
-        try:
-            self.ckanified_metadata = ckanify_dcatus(self.metadata, self.harvest_source)
-        except Exception as e:
-            self.status = "error"
-            raise DCATUSToCKANException(
-                repr(e),
-                self.harvest_source.job_id,
-                self.harvest_source.internal_records_lookup_table[self.identifier],
+        while True:
+            try:
+                return self.harvest_source.db_interface.insert_dataset(dataset_payload)
+            except IntegrityError as error:
+                if not self._is_slug_unique_violation(error):
+                    raise
+
+                logger.info(
+                    "Dataset slug '%s' already exists; generating a new slug",
+                    self.dataset_slug,
+                )
+                self.dataset_slug = add_uuid_to_package_name(self.dataset_slug)
+                dataset_payload["slug"] = self.dataset_slug
+
+    @staticmethod
+    def _is_slug_unique_violation(error: IntegrityError) -> bool:
+        constraint = getattr(getattr(error, "orig", None), "diag", None)
+        if constraint is not None:
+            if getattr(constraint, "constraint_name", None) == "dataset_slug_key":
+                return True
+
+        message = str(getattr(error, "orig", error)).lower()
+        return "dataset" in message and "slug" in message and "unique" in message
+
+
+def harvest_job_starter(job_id, job_type="harvest"):
+    logger.info(f"Harvest job starting for JobId: {job_id}")
+    harvest_source = HarvestSource(job_id, job_type)
+
+    # Check if another job is already in progress for this source
+    jobs = harvest_source.db_interface.get_in_progress_jobs()
+    for job in jobs:
+        if job.harvest_source_id == harvest_source.id and job.id != job_id:
+            logger.error(
+                f"Job {job.id} is already in progress for source {harvest_source.name}. Exiting."
             )
-
-    def sync(self) -> None:
-        if self.valid is False:
-            logger.warning(f"{self.identifier} is invalid. bypassing {self.action}")
+            harvest_source.finish_job_with_status("error")
             return
+    # Check if another task is already running this job
+    handler = create_task_handler()
+    running_tasks = handler.get_running_app_tasks()
+    running_harvest_ids = handler.job_ids_from_tasks(running_tasks)
+    if isinstance(running_harvest_ids, list) and running_harvest_ids.count(job_id) > 1:
+        logger.error(f"Job {job_id} is already running in another task. Exiting.")
+        # Don't finish the job here, just exit to prevent duplicate processing
+        return
 
-        self.ckanify_dcatus()
+    if job_type in ["harvest", "force_harvest", "clear"]:
+        harvest_source.run_full_harvest()
 
-        start = datetime.now(timezone.utc)
+    if job_type == "validate":
+        harvest_source.acquire_minimum_external_data()
+        for record in harvest_source.external_records_to_process():
+            if harvest_source.schema_type.startswith("iso19115"):
+                record.transform()
+            try:
+                record.validate()
+            except:  # noqa: E722
+                pass
 
-        try:
-            if self.action == "create":
-                self.create_record()
-            if self.action == "update":
-                self.update_record()
-        except Exception as e:
-            self.status = "error"
-            raise SynchronizeException(
-                f"failed to {self.action} for {self.identifier} :: {repr(e)}",
-                self.harvest_source.job_id,
-                self.harvest_source.internal_records_lookup_table[self.identifier],
-            )
-        self.update_self_in_db()
-
-        logger.info(
-            f"time to {self.action} {self.identifier} \
-                {datetime.now(timezone.utc)-start}"
-        )
-
-
-def harvest(jobId):
-    logger.info(f"Harvest job starting for JobId: {jobId}")
-    harvest_source = HarvestSource(jobId)
-    harvest_source.get_record_changes()
-    harvest_source.write_compare_to_db()
-    harvest_source.synchronize_records()
+    # generate harvest job report
     harvest_source.report()
+
+    logger.info(f"Harvest job completed for JobId: {job_id}")
+
+    # close the db connection after job to prevent persistent open connections
+    harvest_source.db_interface.close()
+
+
+def check_for_more_work():
+    """Call back to the load manager to start new tasks.
+
+    At the end of the harvest job, look for whether there are still new
+    jobs to be done and schedule at most one new task.
+    """
+    try:
+        LoadManager()._start_new_jobs(check_from_task=True)
+    except Exception as e:
+        logger.error(f"Error checking for more work: {repr(e)}")
+        # We don't want to raise here, just log the error and continue
+        # This is to ensure that the harvest job can finish gracefully
+        # even if there is an issue with checking for more work.
+        # The application should pick up jobs every 15 minutes,
+        # this is only for speed.
+        return
 
 
 if __name__ == "__main__":
@@ -705,9 +1603,14 @@ if __name__ == "__main__":
 
     from harvester.utils.general_utils import parse_args
 
+    exit_code = 0
+
     try:
         args = parse_args(sys.argv[1:])
-        harvest(args.jobId)
-    except SystemExit as e:
+        harvest_job_starter(args.jobId, args.jobType)
+    except Exception as e:
         logger.error(f"Harvest has experienced an error :: {repr(e)}")
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        check_for_more_work()
+        sys.exit(exit_code)

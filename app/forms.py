@@ -1,8 +1,43 @@
+import ast
+import json
+import os
 import re
 
 from flask_wtf import FlaskForm
-from wtforms import SelectField, StringField, TextAreaField
-from wtforms.validators import URL, DataRequired, ValidationError
+from flask_wtf.file import FileAllowed, FileField
+from wtforms import (
+    BooleanField,
+    PasswordField,
+    SelectField,
+    StringField,
+    SubmitField,
+    TextAreaField,
+)
+from wtforms.validators import (
+    URL,
+    DataRequired,
+    Length,
+    Optional,
+    Regexp,
+    ValidationError,
+)
+
+from app.constants import ORGANIZATION_TYPE_SELECT_CHOICES
+from shared.constants import SOURCE_TYPE_VALUES
+
+is_prod = os.getenv("FLASK_ENV") == "production"
+
+
+def validate_json_format(form, field):
+    """
+    Custom validator to check if the field data is valid JSON.
+    """
+    try:
+        json.loads(field.data)
+    except json.JSONDecodeError:
+        raise ValidationError(
+            "Invalid JSON format. Please ensure the data is a valid JSON string."
+        )
 
 
 def validate_email_list(form, field):
@@ -10,6 +45,28 @@ def validate_email_list(form, field):
     for email in emails:
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email.strip()):
             raise ValidationError("Invalid email address: {}".format(email))
+
+
+def strip_filter(data):
+    return data.strip() if isinstance(data, str) else data
+
+
+def comma_separated_filter(data):
+    """Turn the list or the repr of a list into just comma-separated values."""
+    if isinstance(data, list):
+        return ", ".join(data)
+    # we need to string-process data, if we get anything else, pass it along
+    if not isinstance(data, str):
+        return data
+    # "[" isn't likely to be an alias so if we see it, it's probably the repr
+    # of a list
+    if data.startswith("["):
+        try:
+            data_list = ast.literal_eval(data)
+            return ", ".join(data_list)
+        except ValueError:
+            return data
+    return data
 
 
 class EmailListField(TextAreaField):
@@ -25,10 +82,16 @@ class HarvestSourceForm(FlaskForm):
     organization_id = SelectField(
         "Organization", choices=[], validators=[DataRequired()]
     )
-    name = StringField("Name", validators=[DataRequired()])
-    url = StringField("URL", validators=[DataRequired(), URL()])
+    name = StringField("Name", validators=[DataRequired()], filters=[strip_filter])
+    url = StringField(
+        "URL",
+        validators=[DataRequired(), URL(require_tld=is_prod)],
+        filters=[strip_filter],
+    )
     notification_emails = EmailListField(
-        "Notification_emails", validators=[DataRequired(), validate_email_list]
+        "Notification emails",
+        validators=[DataRequired(), validate_email_list],
+        description="Separate multiple addresses with commas.",
     )
     frequency = SelectField(
         "Frequency",
@@ -38,19 +101,224 @@ class HarvestSourceForm(FlaskForm):
     schema_type = SelectField(
         "Schema Type",
         choices=[
-            "iso19115_1",
-            "iso19115_2",
-            "csdgm",
             "dcatus1.1: federal",
             "dcatus1.1: non-federal",
+            "dcatus3.0",
+            "iso19115_1",
+            "iso19115_2",
         ],
         validators=[DataRequired()],
     )
     source_type = SelectField(
-        "Source Type", choices=["document", "waf"], validators=[DataRequired()]
+        "Source Type", choices=SOURCE_TYPE_VALUES, validators=[DataRequired()]
     )
+    collection_parent_url = StringField(
+        "Collection Parent URL",
+        validators=[Optional(), URL(require_tld=is_prod)],
+        filters=[strip_filter],
+        description="Required when Source Type is waf-collection.",
+    )
+    notification_frequency = SelectField(
+        "Notification Frequency",
+        choices=[
+            "on_error",
+            "always",
+            "on_error_or_update",
+        ],
+        validators=[DataRequired()],
+    )
+
+    def validate(self, extra_validators=None):
+        valid = super().validate(extra_validators=extra_validators)
+        if (
+            self.source_type.data == "waf-collection"
+            and not self.collection_parent_url.data
+        ):
+            self.collection_parent_url.errors.append(
+                "Collection Parent URL is required for waf-collection sources."
+            )
+            valid = False
+        return valid
 
 
 class OrganizationForm(FlaskForm):
-    name = StringField("Name", validators=[DataRequired()])
-    logo = StringField("Logo", validators=[DataRequired(), URL()])
+    name = StringField("Name", validators=[DataRequired()], filters=[strip_filter])
+    slug = StringField(
+        "Slug",
+        description=(
+            "Use lowercase letters, digits, and hyphens. "
+            "For example: 'department-of-energy' or 'gsa'."
+        ),
+        validators=[
+            DataRequired(),
+            Length(max=100),
+            Regexp(
+                r"^[a-z0-9-]*$",
+                message=(
+                    "Slug can only contain lowercase letters, digits, and hyphens."
+                ),
+            ),
+        ],
+        filters=[strip_filter],
+    )
+    logo = StringField(
+        "Logo", validators=[DataRequired(), URL()], filters=[strip_filter]
+    )
+    description = TextAreaField(
+        "Description",
+        validators=[Optional()],
+        filters=[strip_filter],
+    )
+
+    organization_type = SelectField(
+        "Organization Type",
+        choices=ORGANIZATION_TYPE_SELECT_CHOICES,
+        validators=[Optional()],
+        default="",
+    )
+    aliases = StringField(
+        "Organization aliases (comma-separated)",
+        validators=[Optional()],
+        filters=[comma_separated_filter],
+        default="",
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.organization_id = kwargs.pop("organization_id", None)
+        self.db_interface = kwargs.pop("db_interface", None)
+        super().__init__(*args, **kwargs)
+
+    def validate_slug(self, field):
+        from database.interface import HarvesterDBInterface
+
+        db_interface = self.db_interface or HarvesterDBInterface()
+        existing = db_interface.get_organization_by_slug(field.data)
+
+        if existing and existing.id != self.organization_id:
+            raise ValidationError("Slug must be unique.")
+
+
+class HarvestTriggerForm(FlaskForm):
+    edit = SubmitField("Edit")
+    harvest = SubmitField("Harvest")
+    clear = SubmitField(
+        "Clear",
+    )
+    delete = SubmitField("Delete")
+    force_check = BooleanField("Force Update")
+
+
+class OrganizationTriggerForm(FlaskForm):
+    edit = SubmitField("Edit")
+    delete = SubmitField("Delete")
+
+
+class DatasetSlugForm(FlaskForm):
+    """
+    Form for editing the slug of a Dataset.
+
+    Validates that the new slug is valid and unique across all
+    datasets, excluding the dataset currently being edited.
+    """
+
+    slug = StringField(
+        "Slug",
+        description=(
+            "Use lowercase letters, digits, and hyphens. "
+            "For example: 'my-dataset-title'."
+        ),
+        validators=[
+            DataRequired(),
+            Length(max=200),
+            Regexp(
+                r"^[a-z0-9-]+$",
+                message=(
+                    "Slug can only contain lowercase letters, digits, and hyphens."
+                ),
+            ),
+        ],
+        filters=[strip_filter],
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.dataset_id = kwargs.pop("dataset_id", None)
+        self.db_interface = kwargs.pop("db_interface", None)
+        super().__init__(*args, **kwargs)
+
+    def validate_slug(self, field):
+        from database.interface import HarvesterDBInterface
+
+        db_interface = self.db_interface or HarvesterDBInterface()
+        existing = db_interface.get_dataset_by_slug(field.data)
+
+        if existing and existing.id != self.dataset_id:
+            raise ValidationError(
+                f"The slug '{field.data}' is already in use by another dataset."
+            )
+
+
+def url_paste_validate(form, field):
+    if form.fetch_method.data == "url":
+        if not form.url.data:
+            raise ValidationError("URL is required.")
+    elif form.fetch_method.data == "paste":
+        if not form.json_text.data:
+            raise ValidationError("JSON input is required.")
+        else:
+            validate_json_format(form, form.json_text)
+    elif form.fetch_method.data == "upload":
+        if not form.json_file.data:
+            raise ValidationError("A JSON file is required.")
+
+    return True
+
+
+class ValidatorForm(FlaskForm):
+    schema = SelectField(
+        "Schema",
+        choices=[
+            "dcatus1.1: federal dataset",
+            "dcatus1.1: non-federal dataset",
+            "dcatus3.0 catalog",
+        ],
+        validators=[DataRequired()],
+    )
+    fetch_method = SelectField(
+        "Fetch Method",
+        choices=[
+            ("url", "Fetch from URL"),
+            ("paste", "Paste JSON"),
+            ("upload", "Upload JSON File"),
+        ],
+        validators=[DataRequired()],
+    )
+    url = StringField(
+        "URL",
+        validators=[url_paste_validate],
+        filters=[strip_filter],
+    )
+
+    def validate_url(self, field):
+        if self.fetch_method.data == "url" and field.data:
+            try:
+                URL(require_tld=is_prod)(self, field)
+            except ValidationError:
+                raise ValidationError("Invalid URL")
+
+    json_text = TextAreaField(
+        "DCATUS Catalog JSON Input",
+        validators=[url_paste_validate],
+    )
+    json_file = FileField(
+        "Upload DCATUS JSON File",
+        validators=[
+            FileAllowed(["json"], "Only .json files are accepted."),
+        ],
+    )
+    submit = SubmitField("Validate")
+
+
+class LocalDevLoginForm(FlaskForm):
+    username = StringField("Username", validators=[DataRequired()])
+    password = PasswordField("Password", validators=[DataRequired()])
+    submit = SubmitField("Log in")

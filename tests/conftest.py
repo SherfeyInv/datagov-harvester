@@ -1,22 +1,33 @@
 import json
 import logging
 import os
+import tempfile
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Generator, List
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from click.testing import CliRunner
 from dotenv import load_dotenv
 from flask import Flask
+from jinja2 import FileSystemLoader
+from opensearchpy.exceptions import NotFoundError
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from app import create_app
 from database.interface import HarvesterDBInterface
-from database.models import HarvestJob, HarvestSource, Organization, db
+from database.models import HarvestJob, HarvestSource, Locations, Organization, db
 from harvester.lib.load_manager import create_future_date
 from harvester.utils.general_utils import dataset_to_hash, sort_dataset
+from search.client import OpenSearchClient
+from search.config import INDEX_NAME
+from search.reader import OpenSearchReader
+from search.writer import OpenSearchWriter
 
 load_dotenv()
+os.environ.setdefault("HARVEST_API_TOKEN", "test-harvest-api-token")
 
 logger = logging.getLogger("pytest.conftest")
 
@@ -30,34 +41,71 @@ collect_ignore_glob = ["functional/*"]
 
 @pytest.fixture(scope="session", autouse=True)
 def default_session_fixture():
-    with patch("harvester.lib.cf_handler.CloudFoundryClient"), patch(
-        "harvester.lib.cf_handler.TaskManager"
-    ), patch("app.load_manager.start", lambda: True):
+    with (
+        patch("harvester.lib.cf_handler.CloudFoundryClient"),
+        patch("harvester.utils.general_utils.smtplib"),
+        patch("app.deps.load_manager.start", lambda: True),
+    ):
         yield
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="session", autouse=True)
 def app() -> Generator[Any, Flask, Any]:
     app = create_app()
     app.config.update({"TESTING": True})
+    return app
+
+
+@pytest.fixture(autouse=True)
+def enable_named_logger_propagation():
+    loggers = [
+        logging.getLogger("harvest_admin"),
+        logging.getLogger("harvest_runner"),
+    ]
+    original_propagation = {logger.name: logger.propagate for logger in loggers}
+
+    for named_logger in loggers:
+        named_logger.propagate = True
+
+    yield
+
+    for named_logger in loggers:
+        named_logger.propagate = original_propagation[named_logger.name]
+
+
+@pytest.fixture(autouse=True)
+def dbapp(app):
     with app.app_context():
+        db.drop_all()  # drop unconditionally in case tests errored and the db isn't clean...
         db.create_all()
+        # Add US location, used in multiple tests
+        us = Locations(
+            **{
+                "id": "34315",
+                "type": "country",
+                "name": "United States",
+                "display_name": "United States",
+                "the_geom": "0103000020E6100000010000000500000069ACFD9DED2E5FC0F302ECA3538B384069ACFD9DED2E5FC0D4EE5701BEB148401CB7989F1BBD50C0D4EE5701BEB148401CB7989F1BBD50C0F302ECA3538B384069ACFD9DED2E5FC0F302ECA3538B3840",  # noqa E501
+                "type_order": "1",
+            }
+        )
+        db.session.add(us)
+        db.session.commit()
         yield app
-        db.drop_all()
 
 
-@pytest.fixture(scope="function")
-def client(app):
+@pytest.fixture()
+def client(app: dbapp):
     return app.test_client()
 
 
-@pytest.fixture(scope="function")
-def session(app) -> Generator[Any, scoped_session, Any]:
+@pytest.fixture()
+def session(app: dbapp) -> Generator[Any, scoped_session, Any]:
     with app.app_context():
         connection = db.engine.connect()
         transaction = connection.begin()
 
-        SessionLocal = sessionmaker(bind=connection, autocommit=False, autoflush=False)
+        SessionLocal = sessionmaker(bind=connection, autoflush=True)
         session = scoped_session(SessionLocal)
         yield session
 
@@ -66,18 +114,24 @@ def session(app) -> Generator[Any, scoped_session, Any]:
         connection.close()
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture()
 def interface(session) -> HarvesterDBInterface:
     return HarvesterDBInterface(session=session)
 
 
-@pytest.fixture(scope="function", autouse=True)
-def default_function_fixture(interface):
+@pytest.fixture(autouse=True)
+def default_function_fixture(interface, monkeypatch):
+    monkeypatch.delenv("ENABLE_LOCAL_DEV_LOGIN", raising=False)
     logger.info("Patching core.feature.service")
-    with patch("harvester.harvest.db_interface", interface), patch(
-        "harvester.exceptions.db_interface", interface
-    ), patch("harvester.lib.load_manager.interface", interface), patch(
-        "app.routes.db", interface
+    with (
+        patch("harvester.harvest.db_interface", interface),
+        patch("harvester.exceptions.db_interface", interface),
+        patch("harvester.lib.load_manager.interface", interface),
+        patch("app.deps.db", interface),
+        patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: interface,
+        ),
     ):
         yield
     logger.info("Patching complete. Unpatching")
@@ -85,9 +139,32 @@ def default_function_fixture(interface):
 
 @pytest.fixture
 def fixtures_json():
-    file = Path(__file__).parents[0] / "fixtures.json"
+    from tests.generate_fixtures import generate_dynamic_fixtures
+
+    return generate_dynamic_fixtures()
+
+
+@pytest.fixture
+def dol_distribution_json():
+    file = Path(__file__).parents[0] / "distribution-examples/dol-example.json"
     with open(file, "r") as file:
         return json.load(file)
+
+
+@pytest.fixture
+def dcatus_long_description_json():
+    file = (
+        Path(__file__).parents[1] / "example_data/dcatus/dcatus_long_description.json"
+    )
+    with open(file, "r") as file:
+        return file.read()
+
+
+@pytest.fixture
+def dcatus_bad_license_uri_json():
+    file = Path(__file__).parents[1] / "example_data/dcatus/dcatus_bad_license_uri.json"
+    with open(file, "r") as file:
+        return file.read()
 
 
 ## ORGS
@@ -99,6 +176,12 @@ def organization_data(fixtures_json) -> dict:
 @pytest.fixture
 def organization_data_orm(organization_data: dict) -> Organization:
     return Organization(**organization_data)
+
+
+## DATASETS
+@pytest.fixture
+def dataset_data(fixtures_json) -> dict:
+    return fixtures_json["dataset"][0]
 
 
 ## HARVEST SOURCES
@@ -117,12 +200,163 @@ def source_data_dcatus_2(organization_data: dict) -> dict:
     return {
         "id": "3f2652de-91df-4c63-8b53-bfced20b276b",
         "name": "Test Source 2",
-        "notification_emails": "email@example.com",
+        "notification_emails": ["email@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_2.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0(organization_data: dict) -> dict:
+    return {
+        "id": "3e4b1d4a-969b-4b80-b299-407c757afe9d",
+        "name": "Test Source DCAT-US 3.0",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_invalid(organization_data: dict) -> dict:
+    return {
+        "id": "59d4cf5b-d98b-4ff4-b10d-3bf20082478b",
+        "name": "Test Source DCAT-US 3.0 (invalid)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_invalid.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_nested_catalog(organization_data: dict) -> dict:
+    return {
+        "id": "0d3d6d0d-6b6a-4b5e-9d6a-8f9b1a7c9d1e",
+        "name": "Test Source DCAT-US 3.0 (nested catalog)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_nested_catalog.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_no_identifier(organization_data: dict) -> dict:
+    return {
+        "id": "7f8a2c1e-4d5b-4a9f-8e6c-1b2d3e4f5a6b",
+        "name": "Test Source DCAT-US 3.0 (no identifier)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_no_identifier.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_with_services(organization_data: dict) -> dict:
+    return {
+        "id": "a2c4e6f8-1234-4567-89ab-cdef01234567",
+        "name": "Test Source DCAT-US 3.0 (with services)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_with_services.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_service_no_identifier(organization_data: dict) -> dict:
+    return {
+        "id": "b3d5f7a9-2345-4678-9abc-def012345678",
+        "name": "Test Source DCAT-US 3.0 (service no identifier)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_service_no_identifier.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_with_records(organization_data: dict) -> dict:
+    return {
+        "id": "c5e7a9b1-4567-489a-bcde-f01234567891",
+        "name": "Test Source DCAT-US 3.0 (with catalog records)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_with_records.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_record_no_id(organization_data: dict) -> dict:
+    return {
+        "id": "d6f8b0c2-5678-49ab-cdef-012345678912",
+        "name": "Test Source DCAT-US 3.0 (catalog record no @id)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_record_no_id.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_service_serves_dataset(organization_data: dict) -> dict:
+    return {
+        "id": "e8a0c2d4-6789-4abc-def0-123456789012",
+        "name": "Test Source DCAT-US 3.0 (service serves dataset)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_service_serves_dataset.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_series_with_members(organization_data: dict) -> dict:
+    return {
+        "id": "f0b1c3d5-7890-4bcd-ef01-234567890124",
+        "name": "Test Source DCAT-US 3.0 (series with members)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_series_with_members.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
     }
 
 
@@ -131,12 +365,43 @@ def source_data_dcatus_same_title(organization_data: dict) -> dict:
     return {
         "id": "50301cdb-5766-46ed-8f46-ca63844315a2",
         "name": "Test Source Same Title",
-        "notification_emails": "email@example.com",
+        "notification_emails": ["email@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_same_title.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_no_identifier(organization_data: dict) -> dict:
+    return {
+        "id": "48f1b0d6-ecd7-4b5f-9e5d-9e2146e21f77",
+        "name": "Test Source (no identifier)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_no_identifier.json",
+        "schema_type": "dcatus1.1: federal",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_cant_translate_spatial(organization_data: dict) -> dict:
+    return {
+        "id": "b3360061-bdf6-4fb5-885f-805d90726f92",
+        "name": "Test Source (cant translate spatial)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_spatial_no_translate.json",
+        "schema_type": "dcatus1.1: federal",
+        "source_type": "document",
+        "notification_frequency": "always",
     }
 
 
@@ -145,12 +410,13 @@ def source_data_waf_csdgm(organization_data: dict) -> dict:
     return {
         "id": "55dca495-3b92-4fe4-b9c5-d433cbc3c82d",
         "name": "Test Source (WAF CSDGM)",
-        "notification_emails": "wafl@example.com",
+        "notification_emails": ["wafl@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/waf/",
         "schema_type": "csdgm",
         "source_type": "waf",
+        "notification_frequency": "always",
     }
 
 
@@ -159,12 +425,49 @@ def source_data_waf_iso19115_2(organization_data: dict) -> dict:
     return {
         "id": "8c3cd8c5-6174-42ef-9512-10503533c3a9",
         "name": "Test Source (WAF ISO19115_2)",
-        "notification_emails": "wafl@example.com",
+        "notification_emails": ["wafl@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/iso_2_waf/",
         "schema_type": "iso19115_2",
         "source_type": "waf",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_iso19115_2_orm(source_data_waf_iso19115_2: dict) -> HarvestSource:
+    return HarvestSource(**source_data_waf_iso19115_2)
+
+
+@pytest.fixture
+def source_data_iso19115_2_document(organization_data: dict) -> dict:
+    return {
+        "id": "8c3cd8c5-6174-42ef-9512-10503533c3a8",
+        "name": "Test Source (ISO19115_2 document)",
+        "notification_emails": ["wafl@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/iso_2_waf/valid_iso2.xml",
+        "schema_type": "iso19115_2",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_waf_collection(organization_data: dict) -> dict:
+    return {
+        "id": "8c3cd8c5-6174-42ef-9512-10503533c3a8",
+        "name": "Test Source (Waf collection)",
+        "notification_emails": ["wafl@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/iso_2_waf/",
+        "schema_type": "iso19115_2",
+        "source_type": "waf-collection",
+        "collection_parent_url": f"{HARVEST_SOURCE_URL}/valid_iso2_parent.xml",
+        "notification_frequency": "always",
     }
 
 
@@ -173,12 +476,13 @@ def source_data_dcatus_invalid(organization_data: dict) -> dict:
     return {
         "id": "2bfcb047-70dc-435a-a46c-4dec5df7532d",
         "name": "Test Source ( Invalid Records )",
-        "notification_emails": "invalid@example.com",
+        "notification_emails": ["invalid@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/missing_title.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
+        "notification_frequency": "always",
     }
 
 
@@ -187,12 +491,13 @@ def source_data_dcatus_single_record(organization_data: dict) -> dict:
     return {
         "id": "2f2652de-91df-4c63-8b53-bfced20b276b",
         "name": "Single Record Test Source",
-        "notification_emails": "email@example.com",
+        "notification_emails": ["email@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_single_record.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
+        "notification_frequency": "on_error",
     }
 
 
@@ -201,12 +506,43 @@ def source_data_dcatus_single_record_non_federal(organization_data: dict) -> dic
     return {
         "id": "2f2652de-91df-4c63-8b53-bfced20b276b",
         "name": "Single Record Test Source",
-        "notification_emails": "email@example.com",
+        "notification_emails": ["email@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_single_record_non-federal.json",
         "schema_type": "dcatus1.1: non-federal",
         "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_bad_license_uri(organization_data: dict) -> dict:
+    return {
+        "id": "2f2652de-91df-4c63-8b53-bfced20b276b",
+        "name": "Single Record Test Source",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_bad_license_uri.json",
+        "schema_type": "dcatus1.1: non-federal",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_multiple_invalid(organization_data: dict) -> dict:
+    return {
+        "id": "2f2652de-91df-4c63-8b53-bfced20b276b",
+        "name": "Single Record Test Source",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_multiple_invalid.json",
+        "schema_type": "dcatus1.1: non-federal",
+        "source_type": "document",
+        "notification_frequency": "always",
     }
 
 
@@ -215,12 +551,13 @@ def source_data_dcatus_bad_url(organization_data: dict) -> dict:
     return {
         "id": "b059e587-a4a1-422e-825a-830b4913dbfb",
         "name": "Bad URL Source",
-        "notification_emails": "bad@example.com",
+        "notification_emails": ["bad@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/bad_url.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
+        "notification_frequency": "always",
     }
 
 
@@ -229,12 +566,43 @@ def source_data_dcatus_invalid_records(organization_data) -> dict:
     return {
         "id": "8e7f539b-0a83-43ad-950e-3976bb11a425",
         "name": "Invalid Record Source",
-        "notification_emails": "invalid_record@example.com",
+        "notification_emails": ["invalid_record@example.com"],
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": "http://localhost/dcatus/missing_title.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_long_description(organization_data: dict) -> dict:
+    return {
+        "id": "2f2652de-91df-4c63-8b53-bfced20b276c",
+        "name": "Long Description Test Source",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_long_description.json",
+        "schema_type": "dcatus1.1: federal",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_none_value(organization_data: dict) -> dict:
+    return {
+        "id": "2f2652de-91df-4c63-8b53-bfced20b276c",
+        "name": "Modified Null Test Source",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_with_none.json",
+        "schema_type": "dcatus1.1: federal",
+        "source_type": "document",
+        "notification_frequency": "always",
     }
 
 
@@ -242,6 +610,11 @@ def source_data_dcatus_invalid_records(organization_data) -> dict:
 @pytest.fixture
 def job_data_dcatus(fixtures_json) -> dict:
     return fixtures_json["job"][0]
+
+
+@pytest.fixture
+def job_data_new(fixtures_json) -> dict:
+    return [job for job in fixtures_json["job"] if job["status"] == "new"][0]
 
 
 @pytest.fixture
@@ -259,11 +632,115 @@ def job_data_dcatus_2(source_data_dcatus_2: dict) -> dict:
 
 
 @pytest.fixture
-def job_data_waf_csdgm(source_data_waf_csdgm: dict) -> dict:
+def job_data_dcatus3_0(source_data_dcatus3_0: dict) -> dict:
     return {
-        "id": "963cdc51-94d5-425d-a688-e0a57e0c5dd2",
+        "id": "d6141347-e91c-41a3-9754-8c1e354b6bb2",
         "status": "new",
-        "harvest_source_id": source_data_waf_csdgm["id"],
+        "harvest_source_id": source_data_dcatus3_0["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_nested_catalog(
+    source_data_dcatus3_0_nested_catalog: dict,
+) -> dict:
+    return {
+        "id": "1f2e3d4c-5b6a-7980-8f1e-2d3c4b5a6978",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_nested_catalog["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_invalid(source_data_dcatus3_0_invalid: dict) -> dict:
+    return {
+        "id": "1b3c74e2-71d9-460b-bfcf-5e96c1ab345f",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_invalid["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_no_identifier(source_data_dcatus3_0_no_identifier: dict) -> dict:
+    return {
+        "id": "8a9b0c1d-2e3f-4a5b-9c8d-7e6f5a4b3c2d",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_no_identifier["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_with_services(
+    source_data_dcatus3_0_with_services: dict,
+) -> dict:
+    return {
+        "id": "c4e6a8b0-3456-4789-abcd-ef0123456789",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_with_services["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_service_no_identifier(
+    source_data_dcatus3_0_service_no_identifier: dict,
+) -> dict:
+    return {
+        "id": "d5f7b9a1-4567-489a-bcde-f01234567890",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_service_no_identifier["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_with_records(
+    source_data_dcatus3_0_with_records: dict,
+) -> dict:
+    return {
+        "id": "e7a9c1d3-6789-4abc-def0-123456789123",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_with_records["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_record_no_id(
+    source_data_dcatus3_0_record_no_id: dict,
+) -> dict:
+    return {
+        "id": "f8b0d2e4-789a-4bcd-ef01-234567891234",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_record_no_id["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_service_serves_dataset(
+    source_data_dcatus3_0_service_serves_dataset: dict,
+) -> dict:
+    return {
+        "id": "f9b1d3e5-789a-4bcd-ef01-234567890123",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_service_serves_dataset["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_series_with_members(
+    source_data_dcatus3_0_series_with_members: dict,
+) -> dict:
+    return {
+        "id": "a1c2e4f6-8901-4cde-f012-345678901235",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_series_with_members["id"],
+    }
+
+
+@pytest.fixture
+def job_data_dcatus_no_identifier(source_data_dcatus_no_identifier: dict) -> dict:
+    return {
+        "id": "b9457afe-d5a3-48e3-ab97-2e9f728013a1",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus_no_identifier["id"],
     }
 
 
@@ -316,6 +793,17 @@ def source_data_dcatus_invalid_records_job(
     }
 
 
+@pytest.fixture
+def job_data_dcatus_long_description(
+    source_data_dcatus_long_description: dict,
+) -> dict:
+    return {
+        "id": "2b57046b-cfda-4a37-bf84-a4766a54a744",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus_long_description["id"],
+    }
+
+
 ## HARVEST JOB ERRORS
 @pytest.fixture
 def job_error_data(fixtures_json) -> dict:
@@ -354,9 +842,37 @@ def record_error_data_2(record_data_dcatus_2) -> dict:
     return [
         {
             "harvest_record_id": record_data_dcatus_2[0]["id"],
+            "harvest_job_id": record_data_dcatus_2[0]["harvest_job_id"],
             "message": "record is invalid",
             "type": "ValidationException",
         }
+    ]
+
+
+@pytest.fixture
+def duplicated_identifier_records():
+    return [
+        {
+            "identifier": "GSA-2015-02-26-1",
+            "title": "Networx Business Volume FY2013, 3rd Qtr",
+            "description": "Original dataset",
+            "accessLevel": "public",
+            "modified": "2019-06-12",
+        },
+        {
+            "identifier": "GSA-2015-02-26-1",
+            "title": "Duplicate Dataset",
+            "description": "This is first duplicate of the dataset above.",
+            "accessLevel": "public",
+            "modified": "2019-07-01",
+        },
+        {
+            "identifier": "GSA-2015-02-26-1",
+            "title": "Duplicate Dataset",
+            "description": "This is second duplicate of the dataset above.",
+            "accessLevel": "public",
+            "modified": "2019-08-01",
+        },
     ]
 
 
@@ -404,7 +920,6 @@ def interface_with_multiple_sources(
     return interface_with_fixture_json
 
 
-## MISC
 @pytest.fixture
 def interface_with_multiple_jobs(interface_no_jobs, source_data_dcatus):
     statuses = ["new", "in_progress", "complete", "error"]
@@ -533,8 +1048,18 @@ def latest_records(
             "source_raw": "data_123",
             "status": "success",
             "action": "create",
+            # different harvest source and job
             "harvest_source_id": source_data_dcatus_2["id"],
-            "harvest_job_id": job_data_dcatus_2["id"],  #
+            "harvest_job_id": job_data_dcatus_2["id"],
+        },
+        {
+            "identifier": "f",
+            "date_created": "2024-04-04T00:00:00.001Z",
+            "source_raw": "data_123456",
+            "status": "success",
+            "action": "update",
+            "harvest_source_id": source_data_dcatus_2["id"],
+            "harvest_job_id": job_data_dcatus_2["id"],
         },
     ]
 
@@ -612,9 +1137,20 @@ def single_internal_record(internal_compare_data):
 
 
 @pytest.fixture
+def waf_datetime_filtered_internal_record(source_data_waf_iso19115_2):
+    return {
+        "harvest_source_id": source_data_waf_iso19115_2["id"],
+        "identifier": "http://localhost:80/iso_2_waf/to_be_filtered_by_datetime.xml",
+        "date_finished": datetime.now(),
+        "source_hash": "a",
+        "status": "success",
+        "action": "create",
+    }
+
+
+@pytest.fixture
 def dhl_cf_task_data() -> dict:
     return {
-        "app_guuid": "f4ab7f86-bee0-44fd-8806-1dca7f8e215a",
         "task_id": "cf_task_integration",
         "command": "/usr/bin/sleep 60",
     }
@@ -625,6 +1161,7 @@ def iso19115_2_transform() -> dict:
     return {
         "@type": "dcat:Dataset",
         "title": "Bringing Wetlands to Market: Expanding Blue Carbon Implementation - NERRS/NSC(NERRS Science Collaborative)",
+        "description": "Blue carbon storage – carbon sequestration in coastal wetlands – can help coastal managers and policymakers achieve broader wetlands management, restoration, and conservation goals, in part by securing payment for carbon credits. Despite considerable interest in bringing wetland restoration projects to market, the transaction costs related to quantifying greenhouse gas fluxes and carbon storage in restored marsh has been a significant limiting factor to realizing these projects. The Waquoit Bay National Estuarine Research Reserve has been at the forefront of blue carbon research and end user engagement. Building on the efforts of a previous project, Bringing Wetlands to Market in Massachusetts, this project developed a verified and generalized model that can be used across New England and the mid-Atlantic East Coast to assess and predict greenhouse gas fluxes and potential wetland carbon across a wide\nenvironmental gradient using a small set of readily available data. Using this model, the project conducted a first-of-its-kind market feasibility assessment for the Herring River Restoration Project, one of the largest potential wetland restoration projects in New England. The project team developed targeted tools and education programs for coastal managers, decision makers, and teachers. These efforts have built an understanding of blue carbon and the capacity to integrate blue carbon considerations into restoration and management decisions.",
         "keyword": [
             "EARTH SCIENCE > BIOSPHERE > ECOSYSTEMS > MARINE ECOSYSTEMS > COASTAL",
             "EARTH SCIENCE > HUMAN DIMENSIONS > ENVIRONMENTAL GOVERNANCE/MANAGEMENT",
@@ -637,17 +1174,771 @@ def iso19115_2_transform() -> dict:
             "DOC/NOAA/NOS/OCM > Office of Coastal Management, National Ocean Service, NOAA, U.S. Department of Commerce",
             "NERRS",
         ],
-        "contactPoint": {"@type": "vcard:Contact", "fn": "", "hasEmail": ""},
+        "modified": "2024-02-29T00:00:00.000+00:00",
+        "publisher": {
+            "@type": "org:Organization",
+            "name": "Office for Coastal Management",
+        },
+        "contactPoint": {
+            "@type": "vcard:Contact",
+            "fn": "Office for Coastal Management",
+            "hasEmail": "mailto:test@gmail.com",
+        },
+        "identifier": "gov.noaa.nmfs.inport:47598",
         "accessLevel": "non-public",
-        "bureauCode": [],
-        "programCode": [],
-        "distribution": [],
+        "distribution": [
+            {
+                "@type": "dcat:Distribution",
+                "description": "Continuous Monitoring Data From Herring River Wetlands, Cape Cod, Massachusetts, 2015 to January 2020",
+                "accessURL": "https://www.sciencebase.gov/catalog/item/5eab1f3582cefae35a225504",
+                "mediaType": "text/html",
+                "title": "https://www.sciencebase.gov/catalog/item/5eab1f3582cefae35a225504",
+            },
+            {
+                "@type": "dcat:Distribution",
+                "description": "Datasets have been archived and will be made publicly available in September 2021 at the CCRCN Carbon Atlas. Prior to fall 2021, individuals may reach out to Dr. Jim Tang, Associate Scientist, Marine Biological Laboratory (jtang@mbl.edu) to discuss potential applications and request access to the data.",
+                "accessURL": "https://serc.si.edu/coastalcarbon",
+                "mediaType": "text/html",
+                "title": "https://serc.si.edu/coastalcarbon",
+            },
+            {
+                "@type": "dcat:Distribution",
+                "description": "The data are being released in two waves, coincident with two separate papers in 2021. Prior to fall 2021, individuals may reach out to Meagan Eagle, Ph.D. / Research Scientist, U.S. Geological Survey Woods Hole Coastal and Marine Science Center, mgonneea@usgs.gov to discuss potential applications and access to the data.",
+                "accessURL": "https://www.sciencebase.gov/catalog/item/5a748e35e4b00f54eb19f96c",
+                "mediaType": "text/html",
+                "title": "https://www.sciencebase.gov/catalog/item/5a748e35e4b00f54eb19f96c",
+            },
+            {
+                "@type": "dcat:Distribution",
+                "description": "This site provides a project overview and links to all associated products, including data.",
+                "accessURL": "http://www.nerrssciencecollaborative.org/project/Rassman15",
+                "mediaType": "text/html",
+                "title": "http://www.nerrssciencecollaborative.org/project/Rassman15",
+            },
+            {
+                "@type": "dcat:Distribution",
+                "description": "NOAA Data Management Plan for this record on InPort.",
+                "downloadURL": "https://www.fisheries.noaa.gov/inportserve/waf/noaa/nos/ocm/dmp/pdf/47598.pdf",
+                "mediaType": "placeholder/value",
+                "title": "NOAA Data Management Plan (DMP)",
+            },
+            {
+                "@type": "dcat:Distribution",
+                "description": "Global Change Master Directory (GCMD). 2024. GCMD Keywords, Version 19. Greenbelt, MD: Earth Science Data and Information System, Earth Science Projects Division, Goddard Space Flight Center (GSFC), National Aeronautics and Space Administration (NASA). URL (GCMD Keyword Forum Page): https://forum.earthdata.nasa.gov/app.php/tag/GCMD+Keywords",
+                "accessURL": "https://forum.earthdata.nasa.gov/app.php/tag/GCMD%2BKeywords",
+                "mediaType": "text/html",
+                "title": "GCMD Keyword Forum Page",
+            },
+            {
+                "@type": "dcat:Distribution",
+                "description": "View the complete metadata record on InPort for more information about this dataset.",
+                "accessURL": "https://www.fisheries.noaa.gov/inport/item/47598",
+                "mediaType": "text/html",
+                "title": "Full Metadata Record",
+            },
+        ],
         "license": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "rights": "otherRestrictions, unclassified",
         "spatial": "-70.482,41.544,-70.555,41.64",
         "temporal": "2015-09-01T00:00:00+00:00/2019-09-01T00:00:00+00:00",
         "language": [],
-        "theme": "",
-        "references": "https://www.fisheries.noaa.gov/inportserve/waf/noaa/nos/ocm/dmp/pdf/47598.pdf",
-        "primaryITInvestmentUII": "gov.noaa.nmfs.inport:47598",
-        "describedByType": "",
+        "references": [
+            "https://www.fisheries.noaa.gov/inportserve/waf/noaa/nos/ocm/dmp/pdf/47598.pdf"
+        ],
+        "landingPage": "https://www.fisheries.noaa.gov/inport/item/47598",
     }
+
+
+@pytest.fixture
+def iso19115_1_transform() -> dict:
+    return {
+        "@type": "dcat:Dataset",
+        "title": "Demographics for US Census Tracts - 2012 (American Community Survey 2008-2012 Derived Summary Tables)",
+        "description": "This map service displays data derived from the 2008-2012 American Community Survey (ACS). Values derived from the ACS and used for this map service include: Total Population, Population Density (per square mile), Percent Minority, Percent Below Poverty Level, Percent Age (less than 5, less than 18, and greater than 64), Percent Housing Units Built Before 1950, Percent (population) 25 years and over (with less than a High School Degree and with a High School Degree), Percent Linguistically Isolated Households, Population of American Indians and Alaskan Natives, Population of American Indians and Alaskan Natives Below Poverty Level, and Percent Low Income Population (Less Than 2X Poverty Level). This dataset was produced by the US EPA to support research and online mapping activities related to EnviroAtlas. EnviroAtlas (https://www.epa.gov/enviroatlas) allows the user to interact with a web-based, easy-to-use, mapping application to view and analyze multiple ecosystem services for the contiguous United States.",
+        "keyword": [
+            "Human",
+            "Human",
+            "Alabama",
+            "Alaska",
+            "American Samoa",
+            "Arizona",
+            "Arkansas",
+            "California",
+            "Canada",
+            "Colorado",
+            "Connecticut",
+            "Delaware",
+            "Florida",
+            "Georgia",
+            "Hawaii",
+            "Idaho",
+            "Illinois",
+            "Indiana",
+            "Iowa",
+            "Kansas",
+            "Kentucky",
+            "Louisiana",
+            "Maine",
+            "Maryland",
+            "Massachusetts",
+            "Mexico",
+            "Michigan",
+            "Minnesota",
+            "Mississippi",
+            "Missouri",
+            "Montana",
+            "Nebraska",
+            "Nevada",
+            "New Hampshire",
+            "New Jersey",
+            "New Mexico",
+            "New York",
+            "North Carolina",
+            "North Dakota",
+            "Ohio",
+            "Oklahoma",
+            "Oregon",
+            "Pennsylvania",
+            "Rhode Island",
+            "South Carolina",
+            "South Dakota",
+            "Tennessee",
+            "Texas",
+            "United States",
+            "Utah",
+            "Vermont",
+            "Virginia",
+            "Washington",
+            "Washington DC",
+            "West Virginia",
+            "Wisconsin",
+            "Wyoming",
+        ],
+        "modified": "2017-05-23T00:00:00.000+00:00",
+        "publisher": {
+            "@type": "org:Organization",
+            "name": "U.S. EPA Office of Environmental Information (OEI) - Office of Information Analysis and Access (OIAA)",
+        },
+        "contactPoint": {
+            "@type": "vcard:Contact",
+            "fn": "U.S. Environmental Protection Agency, Office of Research and Development-Sustainable and Healthy Communities Research Program, EnviroAtlas",
+            "hasEmail": "mailto:enviroatlas@epa.gov",
+        },
+        "identifier": "{4c6928d8-6ac2-4909-8b3d-a29e2805ce2d}",
+        "accessLevel": "non-public",
+        "distribution": [
+            {
+                "@type": "dcat:Distribution",
+                "description": "The endpoint of a web service to access the dataset (REST endpoint, WMS GetCapabilities URL, or a SOAP WSDL endpoint).",
+                "accessURL": "https://enviroatlas.epa.gov/arcgis/rest/services/Other/ACS_Demographics_by_Tract_2008_2012_EA/MapServer",
+                "mediaType": "text/html",
+                "title": "API",
+            }
+        ],
+        "license": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "rights": "otherRestrictions, PUBLIC",
+        "spatial": "-12.68151645,6.65223303,-138.21454852,61.7110157",
+        "temporal": "2008-01-01T00:00:00+00:00/2012-01-01T00:00:00+00:00",
+        "issued": "2017-05-23T00:00:00.000+00:00",
+        "language": [],
+    }
+
+
+@pytest.fixture
+def named_location_us():
+    return (
+        '{"type":"MultiPolygon","coordinates":[[[[-124.733253,24.544245],[-124.733253,49.388611],'
+        "[-66.954811,49.388611],[-66.954811,24.544245],[-124.733253,24.544245]]]]}"
+    )
+
+
+@pytest.fixture
+def named_location_stoneham():
+    return (
+        '{"type":"MultiPolygon","coordinates":[[[[-71.1192,42.444],[-71.1192,42.5022],'
+        "[-71.0749,42.5022],[-71.0749,42.444],[-71.1192,42.444]]]]}"
+    )
+
+
+@pytest.fixture
+def invalid_envelope_geojson():
+    return '{"type": "envelope", "coordinates": [[-81.0563, 34.9991], [-80.6033, 35.4024]]}'
+
+
+@pytest.fixture
+def mock_requests_get_ms_iis_waf(monkeypatch):
+    """Fixture to mock requests.get with ms-iis-waf HTML content"""
+    import requests
+
+    def mock_get(url, *args, **kwargs):
+        """Mock function to return a predefined HTML response"""
+        mock_response = Mock()
+        mock_response.status_code = 200
+
+        # Read mock HTML content from file
+        file_path = Path(__file__).parent / "waf-html-examples/ms-iis-waf.html"
+        with open(file_path, "r", encoding="utf-8") as file:
+            mock_response.text = file.read()
+
+        # Set UTF-8 content
+        mock_response.content = mock_response.text.encode("utf-8")
+
+        return mock_response
+
+    # Apply the patch using monkeypatch
+    monkeypatch.setattr(requests, "get", mock_get)
+
+
+@pytest.fixture
+def dcatus_keywords():
+    return [
+        "EARTH         SCIENCE > BIOSPHERE > ECOSYSTEMS > MARINE ECOSYSTEMS > COASTAL",
+        "earth science",
+        "Waquoit Bay NERR, MA",
+        "DOC/NOAA/NOS/OCM > Office of Coastal Management, National Ocean Service, NOAA, U.S. Department of Commerce",
+        "NERRS",
+    ]
+
+
+@pytest.fixture
+def bad_jsonschema_uri():
+    # this is a truncated value present in the wild via dcatus license
+    return "<p align='center' style='margin-top: 0px; margin-bottom: 1.55rem"
+
+
+@pytest.fixture
+def runner():
+    """
+    Fixture to provide a CLI runner for testing command line interfaces w/ click.
+    """
+    return CliRunner()
+
+
+@pytest.fixture
+def mock_interface():
+    """Mock the HarvesterDBInterface for testing."""
+    with patch("scripts.orphan_job_clean_up.HarvesterDBInterface") as mock_cls:
+        instance = MagicMock()
+        mock_cls.return_value = instance
+        yield instance
+
+
+@pytest.fixture
+def mock_cf_handler():
+    """Fixture to mock CFHandler."""
+    with patch("scripts.orphan_job_clean_up.CFHandler") as mock_handler_class:
+        mock_handler = Mock()
+        mock_handler_class.return_value = mock_handler
+        yield mock_handler
+
+
+@pytest.fixture
+def timestamps():
+    """Fixture providing various timestamps for testing."""
+    now = datetime.now(timezone.utc)
+    return {
+        "now": now,
+        "fresh": (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "stale": (now - timedelta(hours=25)).isoformat().replace("+00:00", "Z"),
+    }
+
+
+@pytest.fixture
+def sample_running_tasks(timestamps):
+    """Fixture providing sample running tasks from CF."""
+    return [
+        {
+            "id": 244,  # sequence_id
+            "guid": "cf-task-guid-1",
+            "command": "python harvester/harvest.py"
+            " 7cd474ba-5437-4d50-b7ec-6114a877510e harvest",
+            "state": "RUNNING",
+            "updated_at": timestamps["stale"],  # Stale task
+            "name": "harvest-job-stale",
+        },
+        {
+            "id": 245,
+            "guid": "cf-task-guid-2",
+            "command": "python harvester/harvest.py"
+            " 12345678-1234-1234-1234-123456789abc harvest",
+            "state": "RUNNING",
+            "updated_at": timestamps["fresh"],  # Fresh task
+            "name": "harvest-job-fresh",
+        },
+        {
+            "id": 246,
+            "guid": "cf-task-guid-3",
+            "command": "python harvester/harvest.py"
+            " abcdef12-3456-7890-abcd-ef1234567890 harvest",
+            "state": "RUNNING",
+            "updated_at": timestamps["stale"],  # Another stale task
+            "name": "harvest-job-stale-2",
+        },
+    ]
+
+
+@pytest.fixture
+def sample_harvest_jobs():
+    """Fixture providing sample harvest job database objects."""
+    job1 = Mock()
+    job1.id = "7cd474ba-5437-4d50-b7ec-6114a877510e"
+
+    job2 = Mock()
+    job2.id = "12345678-1234-1234-1234-123456789abc"
+
+    job3 = Mock()
+    job3.id = "abcdef12-3456-7890-abcd-ef1234567890"
+
+    return {
+        "7cd474ba-5437-4d50-b7ec-6114a877510e": job1,
+        "12345678-1234-1234-1234-123456789abc": job2,
+        "abcdef12-3456-7890-abcd-ef1234567890": job3,
+    }
+
+
+@pytest.fixture
+def dcatus_non_federal_schema():
+    schema = (
+        Path(__file__).parents[1] / "schemas" / "dcatus1.1" / "non-federal_dataset.json"
+    )
+    with open(schema) as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def app_with_temp_template(app):
+    """
+    Provides a flask app with a temporary template directory.
+    This version properly updates the Jinja2 loader.
+    """
+    # Create a temporary directory for templates
+    template_dir = tempfile.mkdtemp()
+
+    # Create test templates
+    test_template = """
+{% block test_block %}
+<p>Hello {{ name }}!</p>
+<div>User input: {{ user_input }}</div>
+{% endblock %}
+    """
+    template_path = Path(template_dir, "test_template.html")
+    with open(template_path, "w") as f:
+        f.write(test_template)
+
+    # Store original loader
+    original_loader = app.jinja_env.loader
+
+    # Create new FileSystemLoader that includes both original and temp directories
+    search_paths = [template_dir]
+
+    # Add original template directories if they exist
+    if hasattr(app, "template_folder") and app.template_folder:
+        if Path(app.template_folder).is_absolute():
+            search_paths.append(app.template_folder)
+        else:
+            search_paths.append(Path(app.root_path, app.template_folder))
+
+    # Update the loader
+    app.jinja_env.loader = FileSystemLoader(search_paths)
+
+    yield app
+
+    # Cleanup
+    app.jinja_env.loader = original_loader
+    os.unlink(template_path)
+    os.rmdir(template_dir)
+
+
+@pytest.fixture
+def mock_progressbar():
+    """Create a mock that acts like click.progressbar context manager."""
+
+    def create_progress_mock(records, **kwargs):
+        mock = Mock()
+        mock.__enter__ = Mock(return_value=records)
+        mock.__exit__ = Mock(return_value=None)
+        return mock
+
+    return create_progress_mock
+
+
+@pytest.fixture
+def mock_db_interface():
+    """Create a mock database interface."""
+    interface = Mock()
+    interface.db = Mock()
+    return interface
+
+
+@pytest.fixture
+def sample_ckan_records():
+    """Sample CKAN records for testing."""
+    return [
+        {
+            "id": "7f9118f0-47b3-46fe-aff8-be811822373a",
+            "name": "test-record-1",
+            "metadata_modified": "2025-06-28T16:55:51.313Z",
+            "identifier": "DASHLINK_872",
+            "harvest_object_id": "537f6d3b-9256-415c-b5f8-aee31f4da580",
+            "harvest_source_title": "nasa-data-json",
+        },
+        {
+            "id": "8f9118f0-47b3-46fe-aff8-be811822373b",
+            "name": "test-record-2",
+            "metadata_modified": "2025-06-28T17:00:00.000Z",
+            "identifier": "DASHLINK_873",
+            "harvest_object_id": "537f6d3b-9256-415c-b5f8-aee31f4da581",
+            "harvest_source_title": "nasa-data-json",
+        },
+    ]
+
+
+@pytest.fixture
+def view_count_datasets():
+    return [
+        {"dataset_slug": "b", "view_count": 5},
+        {"dataset_slug": "c", "view_count": 10},
+        {"dataset_slug": "d", "view_count": 1},
+    ]
+
+
+@pytest.fixture
+def validator_api_url():
+    return {
+        "schema": "dcatus1.1: non-federal dataset",
+        "fetch_method": "url",
+        "url": "http://nginx-harvest-source/dcatus/dcatus_no_identifier.json",
+    }
+
+
+@pytest.fixture
+def validator_api_json(dcatus_bad_license_uri_json):
+    return {
+        "schema": "dcatus1.1: non-federal dataset",
+        "fetch_method": "paste",
+        "json_text": dcatus_bad_license_uri_json,
+    }
+
+
+@pytest.fixture()
+def mock_opensearch():
+    """
+    Fixture for opensearch related tests.
+    """
+    mock_client = MagicMock()
+    mock_client.index_datasets.return_value = (1, 0, [])
+    with patch(
+        "search.client.OpenSearchClient.from_environment",
+        return_value=mock_client,
+    ):
+        yield mock_client
+
+
+class DummyOrg:
+    def to_dict(self):
+        return {"id": "org-1", "name": "Test Org"}
+
+
+@pytest.fixture()
+def sample_dataset():
+    return SimpleNamespace(
+        id="dataset-1",
+        slug="dataset-1",
+        dcat={
+            "title": "Dataset Title",
+            "description": "Dataset description",
+            "publisher": {"name": "Publisher"},
+            "keyword": ["kw-1"],
+            "theme": ["theme-1"],
+            "identifier": "id-1",
+            "spatial": "POINT(1 2)",
+            "modified": date(2024, 1, 2),
+            "isPartOf": "collection-1",
+            "distribution": [
+                {"title": "CSV download"},
+                {"title": "API endpoint"},
+                {"accessURL": "https://example.com/no-title"},
+            ],
+        },
+        last_harvested_date=datetime(2024, 1, 3, 4, 5, 6),
+        translated_spatial={"type": "Point", "coordinates": [1, 2]},
+        organization=DummyOrg(),
+        popularity=7,
+        harvest_record_id="hr-1",
+        harvest_record=SimpleNamespace(source_transform={"title": "Transformed"}),
+    )
+
+
+class FakeIndices:
+    def __init__(self, exists=True):
+        self._exists = exists
+        self.created = None
+        self.refreshed = []
+
+    def exists(self, index):
+        return self._exists
+
+    def create(self, index, body):
+        self.created = {"index": index, "body": body}
+        return {"acknowledged": True}
+
+    def refresh(self, index, request_timeout):
+        self.refreshed.append((index, request_timeout))
+        return {"result": "refreshed"}
+
+
+class FakeClient:
+    def __init__(self, exists=True):
+        self.indices = FakeIndices(exists=exists)
+        self.deleted = []
+
+    def delete(self, index, id, ignore, request_timeout):
+        self.deleted.append((index, id, ignore, request_timeout))
+        return {"result": "deleted"}
+
+
+@pytest.fixture(scope="session")
+def opensearch_client():
+    client = OpenSearchClient.from_environment()
+    yield client
+    client.client.close()
+
+
+@pytest.fixture
+def clean_opensearch_index(opensearch_client):
+    def clean():
+        client = opensearch_client.client
+
+        try:
+            if client.indices.exists(index=INDEX_NAME):
+                client.delete_by_query(
+                    index=INDEX_NAME,
+                    body={"query": {"match_all": {}}},
+                    conflicts="proceed",
+                    refresh=True,
+                    wait_for_completion=True,
+                )
+                client.indices.refresh(index=INDEX_NAME)
+        except NotFoundError:
+            pass
+
+    clean()
+    yield opensearch_client
+    clean()
+
+
+@pytest.fixture
+def opensearch_reader(clean_opensearch_index):
+    return OpenSearchReader(clean_opensearch_index)
+
+
+@pytest.fixture
+def opensearch_writer(clean_opensearch_index):
+    return OpenSearchWriter(clean_opensearch_index)
+
+
+@pytest.fixture
+def mock_organization():
+    """Mock organization for dataset tests."""
+    mock_org = Mock()
+    mock_org.to_dict.return_value = {
+        "id": "org-123",
+        "name": "Test Org",
+        "slug": "test-org",
+    }
+    return mock_org
+
+
+@pytest.fixture
+def mock_dataset_with_datetime(mock_organization):
+    """Mock dataset with datetime object in DCAT."""
+    mock_dataset = Mock()
+    mock_dataset.id = "test-id-123"
+    mock_dataset.slug = "test-dataset"
+    mock_dataset.dcat = {
+        "title": "Test Dataset",
+        "description": "Test description",
+        "modified": datetime(2023, 6, 22, 20, 25, 39, 652070),
+        "keyword": ["health", "education"],
+        "publisher": {"name": "Test Publisher"},
+    }
+    mock_dataset.popularity = 100
+    mock_dataset.organization = mock_organization
+    return mock_dataset
+
+
+@pytest.fixture
+def mock_dataset_with_date(mock_organization):
+    """Mock dataset with date object in DCAT."""
+    mock_dataset = Mock()
+    mock_dataset.id = "test-id-456"
+    mock_dataset.slug = "test-dataset-2"
+    mock_dataset.dcat = {
+        "title": "Test Dataset 2",
+        "description": "Test description 2",
+        "issued": date(2006, 5, 31),
+        "keyword": [],
+        "publisher": {"name": "Test Publisher"},
+    }
+    mock_dataset.popularity = 50
+    mock_dataset.organization = mock_organization
+    return mock_dataset
+
+
+@pytest.fixture
+def mock_dataset_with_string_dates(mock_organization):
+    """Mock dataset with string dates in DCAT."""
+    mock_dataset = Mock()
+    mock_dataset.id = "test-id-789"
+    mock_dataset.slug = "test-dataset-3"
+    mock_dataset.dcat = {
+        "title": "Test Dataset 3",
+        "description": "Test description 3",
+        "modified": "2023-06-22T20:25:39.652070",
+        "issued": "2006-05-31",
+        "keyword": [],
+        "publisher": {},
+    }
+    mock_dataset.popularity = None
+    mock_dataset.organization = mock_organization
+    return mock_dataset
+
+
+@pytest.fixture
+def mock_dataset_with_spatial(mock_organization):
+    """Mock dataset with spatial data and datetime in DCAT."""
+    mock_dataset = Mock()
+    mock_dataset.id = "test-id-spatial"
+    mock_dataset.slug = "test-spatial-dataset"
+    mock_dataset.dcat = {
+        "title": "Spatial Dataset",
+        "description": "Dataset with spatial info",
+        "modified": datetime(2023, 1, 15, 10, 30, 0),
+        "spatial": "United States",
+        "keyword": ["geography", "maps"],
+        "publisher": {},
+    }
+    mock_dataset.popularity = 200
+    mock_dataset.organization = mock_organization
+    return mock_dataset
+
+
+def make_dataset_by_dcat(dcat: dict, mock_organization: Mock) -> Mock:
+    """Return a minimal mock dataset whose dcat is the supplied dict."""
+    dataset = Mock()
+    dataset.id = "dist-test-id"
+    dataset.slug = "dist-test-dataset"
+    dataset.last_harvested_date = Mock()
+    dataset.last_harvested_date.isoformat.return_value = "2024-01-01"
+    dataset.translated_spatial = None
+    dataset.harvest_record_id = "harvest-rec-id"
+    dataset.harvest_record = None
+    dataset.popularity = 0
+    dataset.organization = mock_organization
+    dataset.dcat = dcat
+    return dataset
+
+
+def create_record_for_dataset(
+    interface,
+    organization_data,
+    source_data_dcatus,
+    job_data_dcatus,
+    identifier="dataset-popularity-record",
+):
+    interface.add_organization(organization_data)
+    interface.add_harvest_source(source_data_dcatus)
+    job_data_dcatus["harvest_source_id"] = source_data_dcatus["id"]
+    interface.add_harvest_job(job_data_dcatus)
+    return interface.add_harvest_record(
+        {
+            "identifier": identifier,
+            "harvest_job_id": job_data_dcatus["id"],
+            "harvest_source_id": source_data_dcatus["id"],
+            "status": "success",
+            "action": "create",
+            "source_raw": "{}",
+        }
+    )
+
+
+def dataset_payload(
+    slug,
+    record,
+    organization_data,
+    source_data_dcatus,
+    translated_spatial=None,
+):
+    payload = {
+        "slug": slug,
+        "dcat": {"title": slug},
+        "organization_id": organization_data["id"],
+        "harvest_source_id": source_data_dcatus["id"],
+        "harvest_record_id": record.id,
+        "last_harvested_date": datetime.now(timezone.utc),
+    }
+
+    if translated_spatial is not None:
+        payload["translated_spatial"] = translated_spatial
+
+    return payload
+
+
+@pytest.fixture()
+def slug_protection_dataset(
+    interface,
+    organization_data,
+    source_data_dcatus,
+    job_data_dcatus,
+):
+    """
+    Complete dataset with existing slug.
+    """
+    interface.add_organization(organization_data)
+    interface.add_harvest_source(source_data_dcatus)
+    job_data_dcatus["harvest_source_id"] = source_data_dcatus["id"]
+    interface.add_harvest_job(job_data_dcatus)
+    record = interface.add_harvest_record(
+        {
+            "identifier": "slug-protection-reindex",
+            "harvest_job_id": job_data_dcatus["id"],
+            "harvest_source_id": source_data_dcatus["id"],
+            "status": "success",
+            "action": "create",
+            "source_raw": "{}",
+        }
+    )
+    dataset = interface.insert_dataset(
+        {
+            "slug": "original-slug",
+            "dcat": {"title": "original-slug"},
+            "organization_id": organization_data["id"],
+            "harvest_source_id": source_data_dcatus["id"],
+            "harvest_record_id": record.id,
+            "last_harvested_date": datetime.now(timezone.utc),
+        }
+    )
+    return dataset
+
+
+@pytest.fixture
+def dcatus_3_catalog_missing_identifier():
+    return json.dumps(
+        {
+            "@type": "Catalog",
+            "title": "Catalog With Invalid Homepage",
+            "description": "This catalog has homepage as a string URL instead of a Document object.",
+            "dataset": [
+                {
+                    "@type": "Dataset",
+                    "title": "Example Dataset",
+                    "description": "A valid dataset.",
+                    "contactPoint": {
+                        "fn": "Support",
+                        "hasEmail": "mailto:support@example.gov",
+                    },
+                    "publisher": {"name": "Example Org"},
+                }
+            ],
+        }
+    )

@@ -1,43 +1,66 @@
----
-name: Tests on Commit
+name: 1 - Commit
 on: [push]
 
+permissions:
+    contents: read
+
 env:
-  PY_VERSION: "3.10"
-  POETRY_VERSION: "1.7.1"
+  PY_VERSION: "3.12.13"
+  POETRY_VERSION: "latest"
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     name: Python Lint
     steps:
-      - uses: actions/checkout@v4
-      - uses: chartboost/ruff-action@v1
+      - name: Check out the code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - name: Set up Python ${{ env.PY_VERSION }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+          poetry-plugins: "poetry-plugin-export"
+
+      - name: Install Dependencies
+        run: |
+          poetry env use ${{ env.PY_VERSION }}
+          poetry install
+
+      - name: Run linting
+        run: make lint-check
 
   test:
     environment: development
     env:
-        CKAN_API_TOKEN_DEV: ${{secrets.CKAN_API_TOKEN_DEV}}
         CF_SERVICE_USER: ${{secrets.CF_SERVICE_USER}}
         CF_SERVICE_AUTH: ${{secrets.CF_SERVICE_AUTH}}
-        HARVEST_RUNNER_APP_GUID: ${{secrets.HARVEST_RUNNER_APP_GUID}}
         FLASK_APP_SECRET_KEY: ${{secrets.FLASK_APP_SECRET_KEY}}
     runs-on: ubuntu-latest
     name: Pytests
     steps:
       - name: Check out the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
+      - name: Create local .env from sample
+        run: cp .env.sample .env
       - name: Set up Python ${{ env.PY_VERSION }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
 
       - name: Install Poetry
-        uses: abatilo/actions-poetry@v2
+        uses: abatilo/actions-poetry@v4
         with:
           poetry-version: ${{ env.POETRY_VERSION }}
+          poetry-plugins: "poetry-plugin-export"
 
       - name: Install Dependencies
         run: |
@@ -47,64 +70,81 @@ jobs:
       - name: Run Pytest
         run: make test-ci
 
+      - name: Verify database/interface.py imports standalone
+        run: poetry run python -c "import database.interface"
+
+      - name: Verify migrations match vendored models
+        run: docker compose exec -T app flask db check
+
       - name: Report test coverage
         uses: MishaKav/pytest-coverage-comment@main
+        continue-on-error: true
         with:
-          pytest-coverage-path: pytest-coverage.txt
-          junitxml-path: pytest.xml
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          multiple-files: |
+            Unit tests, pytest-coverage-unit.txt, pytest-unit.xml
+            Integration Tests, pytest-coverage-integration.txt, pytest-integration.xml
+            Functional Tests, pytest-coverage-functional.txt, pytest-functional.xml
 
-  deploy-development:
+  create-cloudgov-services-development:
     if: github.ref == 'refs/heads/develop'
-    name: deploy development
-    needs: test
+    name: create services (development)
     environment: development
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v4
-      - name: Install node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Build static assets
-        shell: bash
-        run: |
-          cd app/static
-          npm install
-          npm run build
-      - name: Install Poetry
-        uses: abatilo/actions-poetry@v2
-        with:
-          poetry-version: ${{ env.POETRY_VERSION }}
-      - name: Add requirement.txt
-        run: |
-          poetry export -f requirements.txt --output requirements.txt --without-hashes
-          echo "Generated requirements.txt:"
-          cat requirements.txt
-      - name: deploy DHL
+        uses: actions/checkout@v7
+      - name: create services
         uses: cloud-gov/cg-cli-tools@main
         with:
-          command: cf push --vars-file vars.development.yml --strategy rolling --no-wait
+          command: bash create_cloudgov_services.sh
           cf_org: gsa-datagov
-          cf_space: ${{vars.ENVIRONMENT_NAME}}
+          cf_space: development
           cf_username: ${{secrets.CF_SERVICE_USER}}
           cf_password: ${{secrets.CF_SERVICE_AUTH}}
-      # to-do
-      # - name: smoke test
-      #   uses: cloud-gov/cg-cli-tools@main
-      #   with:
-      #     command: cf run-task harvesting-logic -c "/home/vcap/app/scripts/smoke-test.py" --name smoke-test
-      #     cf_org: gsa-datagov
-      #     cf_space: ${{vars.ENVIRONMENT_NAME}}
-      #     cf_username: ${{secrets.CF_SERVICE_USER}}
-      #     cf_password: ${{secrets.CF_SERVICE_AUTH}}
-      # - name: monitor task output
-      #   uses: cloud-gov/cg-cli-tools@main
-      #   with:
-      #     command: >
-      #       scripts/monitor-cf-logs.sh harvesting-logic smoke-test
-      #     cf_org: gsa-datagov
-      #     cf_space: ${{vars.ENVIRONMENT_NAME}}
-      #     cf_username: ${{secrets.CF_SERVICE_USER}}
-      #     cf_password: ${{secrets.CF_SERVICE_AUTH}}
+
+  deploy-development:
+    if: github.ref == 'refs/heads/develop'
+    name: deploy (development)
+    needs:
+      - create-cloudgov-services-development
+    environment: development
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+      - name: Deploy via composite action
+        uses: ./.github/actions/deploy
+        with:
+          cf_space: development
+          python-version: ${{ env.PY_VERSION }}
+          poetry-version: ${{ env.POETRY_VERSION }}
+          cf_username: ${{ secrets.CF_SERVICE_USER }}
+          cf_password: ${{ secrets.CF_SERVICE_AUTH }}
+
+  network-policies:
+    name: Add network-policies
+    needs:
+      - deploy-development
+    runs-on: ubuntu-latest
+    environment: development
+    strategy:
+      fail-fast: false
+      matrix:
+        command:
+          [
+            "cf add-network-policy datagov-harvest-proxy datagov-harvest --protocol tcp --port 61443",
+            "cf add-network-policy datagov-harvest mdtranslator --protocol tcp --port 8080",
+          ]
+        environ: ["development"]
+    steps:
+      - name: Add network policy
+        uses: cloud-gov/cg-cli-tools@main
+        with:
+          command: ${{ matrix.command }}
+          cf_org: gsa-datagov
+          cf_space: ${{ matrix.environ }}
+          cf_username: ${{secrets.CF_SERVICE_USER}}
+          cf_password: ${{secrets.CF_SERVICE_AUTH}}

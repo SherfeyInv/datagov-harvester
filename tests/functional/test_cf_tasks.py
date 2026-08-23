@@ -1,23 +1,51 @@
 import os
 from time import sleep
+from unittest.mock import patch
+
+import pytest
+from cloudfoundry_client.errors import InvalidStatusCode
 
 from harvester.lib.cf_handler import CFHandler
+from harvester.lib.cf_handler import logger as cf_logger
 
-cf_handler = CFHandler(
-    os.getenv("CF_API_URL"), os.getenv("CF_SERVICE_USER"), os.getenv("CF_SERVICE_AUTH")
+CF_API_URL = os.getenv("CF_API_URL")
+CF_SERVICE_USER = os.getenv("CF_SERVICE_USER")
+CF_SERVICE_AUTH = os.getenv("CF_SERVICE_AUTH")
+RUNNING_IN_GITHUB = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+HAS_CF_CREDS = all([CF_API_URL, CF_SERVICE_USER, CF_SERVICE_AUTH])
+
+pytestmark = pytest.mark.skipif(
+    not RUNNING_IN_GITHUB and not HAS_CF_CREDS,
+    reason="Cloud Foundry credentials are not configured for functional tests",
 )
 
+if HAS_CF_CREDS:
+    cf_handler = CFHandler(CF_API_URL, CF_SERVICE_USER, CF_SERVICE_AUTH)
+else:
+    if RUNNING_IN_GITHUB:
+        raise RuntimeError(
+            "CF_API_URL, CF_SERVICE_USER, and CF_SERVICE_AUTH "
+            "must be set in GitHub Actions"
+        )
+    cf_handler = None
+
 dhl_cf_task_data = {
-    "app_guuid": os.getenv("HARVEST_RUNNER_APP_GUID"),
     "task_id": "cf_task_func_spec",
     "command": "/usr/bin/sleep 60",
 }
 
 
 class TestCFTasking:
-    def test_crud_task(self):
-        cf_handler.setup()
+    def _assert_cf_warning_logged(self, caplog, action):
+        caplog.set_level("WARNING", logger="harvest_admin")
+        cf_logger.addHandler(caplog.handler)
+        try:
+            action()
+        finally:
+            cf_logger.removeHandler(caplog.handler)
+        assert "Failed to get app tasks" in caplog.text
 
+    def test_crud_task(self):
         # start a new task
         new_task = cf_handler.start_task(**dhl_cf_task_data)
         sleep(2)
@@ -25,9 +53,7 @@ class TestCFTasking:
         task = cf_handler.get_task(new_task["guid"])
 
         # read the recent logs of the task
-        logs = cf_handler.read_recent_app_logs(
-            dhl_cf_task_data["app_guuid"], task["guid"]
-        )
+        logs = cf_handler.read_recent_app_logs(task_id=task["guid"])
         assert logs is not None
 
         # cancel the task
@@ -37,5 +63,51 @@ class TestCFTasking:
     def test_get_all_app_tasks(self):
         cf_handler.setup()
 
-        tasks = cf_handler.get_all_app_tasks(dhl_cf_task_data["app_guuid"])
+        tasks = cf_handler.get_all_app_tasks()
         assert tasks is not None
+
+    @patch("harvester.lib.cf_handler.CloudFoundryClient")
+    def tests_get_all_app_tasks_api_error(self, CFCMock, caplog):
+        cf_handler.setup()
+
+        CFCMock.return_value.v3.apps.get.side_effect = InvalidStatusCode(500, "")
+
+        tasks = None
+
+        def action():
+            nonlocal tasks
+            tasks = cf_handler.get_all_app_tasks()
+
+        self._assert_cf_warning_logged(caplog, action)
+        assert CFCMock.return_value.v3.apps.get.call_count == 1
+        assert tasks is None
+
+    @patch("harvester.lib.cf_handler.CloudFoundryClient")
+    def tests_get_running_app_tasks_api_error(self, CFCMock, caplog):
+        cf_handler.setup()
+
+        CFCMock.return_value.v3.apps.get.side_effect = InvalidStatusCode(500, "")
+
+        tasks = None
+
+        def action():
+            nonlocal tasks
+            tasks = cf_handler.get_running_app_tasks()
+
+        self._assert_cf_warning_logged(caplog, action)
+        assert tasks is None
+
+    @patch("harvester.lib.cf_handler.CloudFoundryClient")
+    def tests_num_running_app_tasks_api_error(self, CFCMock, caplog):
+        cf_handler.setup()
+
+        CFCMock.return_value.v3.apps.get.side_effect = InvalidStatusCode(500, "")
+
+        num_tasks = None
+
+        def action():
+            nonlocal num_tasks
+            num_tasks = cf_handler.num_running_app_tasks()
+
+        self._assert_cf_warning_logged(caplog, action)
+        assert num_tasks is None

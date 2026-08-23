@@ -1,15 +1,24 @@
-FROM python:3.10
+FROM python:3.12.13-alpine3.22
+
+# Pull the latest patched packages from the base distro.
+RUN apk upgrade --no-cache
 
 WORKDIR /app
 
 COPY . /app
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install poetry
 
-ARG DEV 
+# poetry try use virtualenv if .venv is present
+RUN poetry config virtualenvs.create false
+RUN rm -rf /app/.venv
+
+RUN poetry install --without=dev
+
+ARG DEV
 
 RUN if [ $DEV ]; \
-    then pip install --no-cache-dir -r requirements-dev.txt; \
+    then poetry install --with=dev; \
     fi
 
 EXPOSE 8080
@@ -17,4 +26,4 @@ EXPOSE 8080
 ENV FLASK_APP=run.py
 
 # Run run.py when the container launches
-CMD ["flask", "run", "--host=0.0.0.0", "--port=8080"]
+CMD ["/bin/sh", "-c", "flask db upgrade && flask run --host=0.0.0.0 --port=8080"]

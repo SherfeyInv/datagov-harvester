@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h1>JSON Schema Validator</h1>
+
+<div class="usa-alert usa-alert--info margin-bottom-4" id="dcatus3-validator-info" role="region" aria-labelledby="validator-doc-heading">
+  <div class="usa-alert__body">
+
+    <h2 class="usa-alert__heading" id="validator-doc-heading">
+      Validate DCAT-US 3.0 metadata
+    </h2>
+
+    <p class="usa-alert__text margin-top-2 margin-bottom-2">
+      Use this tool to validate catalog metadata against the DCAT-US 3.0 schema.
+      Validation results identify schema errors to help improve metadata
+      quality and interoperability.
+    </p>
+
+    <p class="usa-alert__text">
+      The validator checks submitted metadata for required fields, data
+      structure and formatting, schema compliance, and invalid or unsupported
+      values. Provide a URL to a DCAT-US 3.0 JSON catalog document, paste raw
+      JSON, or upload a document below.
+    </p>
+
+  </div>
+</div>
+
+<form class="usa-form usa-form--large" method="POST" enctype="multipart/form-data">
+    {{ form.hidden_tag() }}
+    
+    <!-- schema and fetch_method can't be empty so they won't have errors to display -->
+    <div class="usa-form-group">
+        <label for="{{ form.schema.id }}" class="usa-label">
+            {{ form.schema.label }}
+        </label>
+        {{ form.schema(class="usa-select") }}
+    </div>
+
+    <div class="usa-form-group">
+        <label for="{{ form.fetch_method.id }}" class="usa-label">
+            {{ form.fetch_method.label }}
+        </label>
+        {{ form.fetch_method(class="usa-select", id="fetch_method") }}
+    </div>
+
+    <div id="url_field" class="usa-form-group">
+
+        <label for="{{ form.url.id }}" class="usa-label">
+            {{ form.url.label }}
+            <button
+                type="button"
+                class="usa-tooltip usa-button--unstyled"
+                data-position="right"
+                data-classes="width-full tablet:width-auto"
+                title="We restrict what documents can be fetched by TLD. Only .gov and .mil are allowed."
+            >
+                <svg class="usa-icon" aria-hidden="true">
+                    <use href="{{ static_url('assets/uswds/img/sprite.svg') }}#info"></use>
+                </svg>
+            </button>
+        </label>
+        {{ form.url(class="usa-input", placeholder="https://example.com/data.json", type="url") }}
+        {% for error in form.url.errors %}
+            <span class="usa-error-message" role="alert">{{ error }}</span>
+        {% endfor %}
+    </div>
+
+    <div id="json_field" class="usa-form-group">
+        <label for="{{ form.json_text.id }}" class="usa-label">
+            {{ form.json_text.label }}
+        </label>
+        {{ form.json_text(class="usa-textarea", rows="10", placeholder='{"key": "value"}') }}
+        {% for error in form.json_text.errors %}
+            <span class="usa-error-message" role="alert">{{ error }}</span>
+        {% endfor %}
+    </div>
+
+    <div id="upload_field" class="usa-form-group">
+        <label for="{{ form.json_file.id }}" class="usa-label">
+            {{ form.json_file.label }}
+        </label>
+        {{ form.json_file(class="usa-file-input") }}
+        {% for error in form.json_file.errors %}
+        <span class="usa-error-message" role="alert">{{ error }}</span>
+        {% endfor %}
+    </div>
+
+    <div class="usa-form-group">
+        {{ form.submit(class="usa-button") }}
+    </div>
+</form>
+
+<div class="usa-summary-box margin-top-4" role="region" aria-labelledby="validator-resources-heading">
+    <div class="usa-summary-box__body">
+        <h2 class="usa-summary-box__heading" id="validator-resources-heading">DCAT-US 3.0 resources</h2>
+        <div class="usa-summary-box__text">
+            <ul class="usa-list">
+                <li>
+                    <a class="usa-link" href="https://resources.data.gov/resources/dcat-us3/"
+                        target="_blank" rel="noopener noreferrer">DCAT-US 3.0 documentation</a>
+                </li>
+                <li>
+                    <a class="usa-link" href="https://github.com/GSA/dcat-us"
+                        target="_blank" rel="noopener noreferrer">DCAT-US 3.0 specification (GitHub)</a>
+                </li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    {% if submitted %}
+        <h2>Validation results</h2>
+        {% set total = data.record_errors | length %}
+        {% if not data.record_errors %}
+            <p>No validation errors found</p>
+        {% else %}
+        <button class="usa-button" id="btn-download" title="Download all {{ total }} error(s) as CSV"
+            aria-label="Download all errors as CSV">
+            <i class="fa fa-download margin-right-1" aria-hidden="true"></i>
+            Download all errors (.csv)
+        </button>
+        <script nonce="{{ csp_nonce() }}" id="all-errors-data" type="application/json">{{ data.record_errors | tojson }}</script>
+        {% if total > 10 %}
+        <p><strong>Showing First 10 of {{ total }}</strong></p>
+        {% endif %}
+        <div class="error-list">
+            {% for record_error in data.record_errors[:10] %}
+            <div class="error-block">
+                <p style="word-break: break-all"><strong>Identifier:</strong> {{ record_error[0] ~ " (dataset position)" if record_error[0] is number else record_error[0] }}</p>
+                <p>
+                    <strong>Error Message:</strong> 
+                    <ul>
+                        <li>{{ record_error[1] }}</li>
+                    </ul>
+                </p>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    {% endif %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+
+<script nonce="{{ csp_nonce() }}">
+    const FIELD_CONFIG = {
+        url: { show: "url_field", clear: ["json_text", "json_file"] },
+        paste: { show: "json_field", clear: ["url", "json_file"] },
+        upload: { show: "upload_field", clear: ["url", "json_text"] },
+    };
+
+    function toggleInputFields() {
+        const method = document.getElementById("fetch_method").value;
+        const config = FIELD_CONFIG[method];
+
+        Object.values(FIELD_CONFIG).forEach(({ show }) => {
+            document.getElementById(show).style.display = "none";
+        });
+
+        document.getElementById(config.show).style.display = "block";
+
+        config.clear.forEach(id => {
+            document.getElementById(id).value = "";
+        });
+    }
+
+    function clearErrors() {
+        document.querySelectorAll(".section, .usa-error-message").forEach(el => el.remove());
+    }
+
+    document.addEventListener("DOMContentLoaded", toggleInputFields);
+
+    document.getElementById("fetch_method").addEventListener("change", toggleInputFields);
+
+    ["fetch_method", "url", "schema", "json_text"].forEach(id => {
+        document.getElementById(id).addEventListener("change", clearErrors);
+    });
+
+    /* ── CSV download of all errors ── */
+    function downloadValidationErrors() {
+        const raw = document.getElementById("all-errors-data");
+        if (!raw) return;
+
+        let errors;
+        try {
+            errors = JSON.parse(raw.textContent);
+        } catch (e) {
+            alert("Could not read error data.");
+            return;
+        }
+
+        const rows = [["Dataset identifier", "Error"]].concat(errors);
+        const csv = rows
+            .map(row =>
+                row.map(cell => '"' + String(cell).replace(/"/g, '""') + '"').join(",")
+            )
+            .join("\r\n");
+
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "validation_errors.csv";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+        const btnDownload = document.getElementById("btn-download");
+        if (btnDownload) {
+            btnDownload.addEventListener("click", downloadValidationErrors);
+        }
+    });
+</script>
+
+{% endblock %}

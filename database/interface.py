@@ -1,91 +1,78 @@
 import logging
-import os
-import time
-import uuid
-from datetime import datetime, timezone
-from functools import wraps
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
 
-import ckanapi
-from ckanapi import RemoteCKAN
-from sqlalchemy import create_engine, func, inspect, or_, select, text
+import sqlalchemy.sql.operators as sa_operators
+from sqlalchemy import Text, asc, cast, desc, exists, func, inspect, literal, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import NoResultFound
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.orm import aliased
 
-from .models import (
+from database.configs import PaginationConfig
+from database.decorators import count, count_wrapper, paginate
+from database.models import (
+    Dataset,
+    DatasetViewCount,
     HarvestJob,
     HarvestJobError,
     HarvestRecord,
     HarvestRecordError,
     HarvestSource,
     HarvestUser,
+    Locations,
     Organization,
+    db,
 )
 
-DATABASE_URI = os.getenv("DATABASE_URI")
-PAGINATE_ENTRIES_PER_PAGE = 20
+PAGINATE_ENTRIES_PER_PAGE = 10
 PAGINATE_START_PAGE = 0
-
-
-def paginate(fn):
-    @wraps(fn)
-    def _impl(self, *args, **kwargs):
-        query = fn(self, *args, **kwargs)
-        if kwargs.get("skip_pagination") is True:
-            return query
-        elif kwargs.get("paginate") is False:
-            return query.all()
-        else:
-            per_page = kwargs.get("per_page") or PAGINATE_ENTRIES_PER_PAGE
-            page = kwargs.get("page") or PAGINATE_START_PAGE
-            query = query.limit(per_page)
-            query = query.offset(page * per_page)
-            return query.all()
-
-    return _impl
-
-
-# notes on the flag `maintain_column_froms`:
-# https://github.com/sqlalchemy/sqlalchemy/discussions/6807#discussioncomment-1043732
-# docs: https://docs.sqlalchemy.org/en/14/core/selectable.html#sqlalchemy.sql.expression.Select.with_only_columns.params.maintain_column_froms
-#
-def count(fn):
-    @wraps(fn)
-    def _impl(self, *args, **kwargs):
-        query = fn(self, *args, **kwargs)
-        if kwargs.get("count") is True:
-            count_q = query.statement.with_only_columns(
-                func.count(), maintain_column_froms=True
-            ).order_by(None)
-            count = query.session.execute(count_q).scalar()
-            return count
-        else:
-            return query
-
-    return _impl
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
 
 class HarvesterDBInterface:
+    pagination = PaginationConfig(
+        entries_per_page=PAGINATE_ENTRIES_PER_PAGE,
+        start_page=PAGINATE_START_PAGE,
+    )
+
     def __init__(self, session=None):
-        if session is None:
-            engine = create_engine(
-                DATABASE_URI,
-                isolation_level="AUTOCOMMIT",
-                pool_size=10,
-                max_overflow=20,
-                pool_timeout=60,
-                pool_recycle=1800,
-            )
-            session_factory = sessionmaker(bind=engine, autoflush=True)
-            self.db = scoped_session(session_factory)
-        else:
-            self.db = session
+        self.db = session if session else db.session
+
+    @staticmethod
+    def query_filter_builder(model, facets_string):
+        """Builds a list of filter expressions from a comma-separated string of facets
+
+        Each facet is of the form "column op value" where `column` is a
+        column name from the model, `op` is one of the operators in
+        `sqlalchemy.sql.operators` like "eq" or "like_op", and `value` is
+        a literal value for the operator.
+
+        The facet string is split on comma characters, so it isn't possible
+        to include commas in the literal values.
+
+        This can raise exceptions if the filters specify nonsensical things about
+        the model. Callers should handle these exceptions.
+        """
+        # empty facet string doesn't play well with our loop below
+        if not facets_string:
+            return []
+
+        facets = []
+        for this_facet in facets_string.split(","):
+            column_name, op, value = this_facet.split(maxsplit=2)
+            # these could raise attribute errors
+            column = getattr(model, column_name)
+            operator = getattr(sa_operators, op)
+            facets.append(operator(column, literal(value, type_=column.type)))
+        return facets
 
     @staticmethod
     def _to_dict(obj):
+        if obj is None:
+            return {}
+
         def to_dict_helper(obj):
             return {
                 c.key: getattr(obj, c.key) for c in inspect(obj).mapper.column_attrs
@@ -96,6 +83,16 @@ class HarvesterDBInterface:
         else:
             return to_dict_helper(obj)
 
+    @staticmethod
+    def _to_list(obj):
+        def to_list_helper(obj):
+            return [getattr(obj, c.key) for c in inspect(obj).mapper.column_attrs]
+
+        if isinstance(obj, list):
+            return [to_list_helper(x) for x in obj]
+        else:
+            return to_list_helper(obj)
+
     ## ORGANIZATIONS
     def add_organization(self, org_data):
         try:
@@ -105,7 +102,7 @@ class HarvesterDBInterface:
             self.db.refresh(new_org)
             return new_org
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
             return None
 
@@ -116,6 +113,14 @@ class HarvesterDBInterface:
         orgs = self.db.query(Organization).all()
         return [org for org in orgs]
 
+    def get_organization_by_slug(self, slug):
+        return self.db.query(Organization).filter(Organization.slug == slug).first()
+
+    def get_organization_by_alias(self, alias):
+        return (
+            self.db.query(Organization).filter(Organization.aliases.any(alias)).first()
+        )
+
     def update_organization(self, org_id, updates):
         try:
             org = self.db.get(Organization, org_id)
@@ -124,7 +129,9 @@ class HarvesterDBInterface:
                 if hasattr(org, key):
                     setattr(org, key, value)
                 else:
-                    print(f"Warning: non-existing field '{key}' in organization")
+                    logger.warning(
+                        "Warning: non-existing field '%s' in organization", key
+                    )
 
             self.db.commit()
             return org
@@ -137,22 +144,54 @@ class HarvesterDBInterface:
         org = self.db.get(Organization, org_id)
         if org is None:
             return None
-        self.db.delete(org)
-        self.db.commit()
-        return "Organization deleted successfully"
+
+        harvest_sources = (
+            self.db.query(HarvestSource)
+            .filter(HarvestSource.organization_id == org_id)
+            .all()
+        )
+
+        if len(harvest_sources) == 0:
+            self.db.delete(org)
+            self.db.commit()
+            return (f"Deleted organization with ID:{org_id} successfully", 200)
+        else:
+            # ruff: noqa: E501
+            return (
+                f"Failed: {len(harvest_sources)} harvest sources in the organization, please delete those first.",
+                409,
+            )
 
     ## HARVEST SOURCES
-    def add_harvest_source(self, source_data):
+    def harvest_source_save_error_message(self, error: Exception) -> str:
+        """Return a user-facing message for harvest source persistence errors."""
+        orig = getattr(error, "orig", error)
+        constraint_name = getattr(getattr(orig, "diag", None), "constraint_name", None)
+        if constraint_name == "harvest_source_url_key":
+            return (
+                "A harvest source with this URL already exists. "
+                "Use a different URL or edit the existing source."
+            )
+        return "Failed to add harvest source."
+
+    def try_add_harvest_source(self, source_data):
         try:
             new_source = HarvestSource(**source_data)
             self.db.add(new_source)
             self.db.commit()
             self.db.refresh(new_source)
-            return new_source
+            return new_source, None
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
-            return None
+            return None, self.harvest_source_save_error_message(e)
+
+    def add_harvest_source(self, source_data):
+        source, _ = self.try_add_harvest_source(source_data)
+        return source
+
+    def get_harvest_source_by_url(self, url: str):
+        return self.db.query(HarvestSource).filter_by(url=url).first()
 
     def get_harvest_source(self, source_id):
         result = self.db.query(HarvestSource).filter_by(id=source_id).first()
@@ -182,7 +221,9 @@ class HarvesterDBInterface:
                 if hasattr(source, key):
                     setattr(source, key, value)
                 else:
-                    print(f"Warning: non-existing field '{key}' in HarvestSource")
+                    logger.warning(
+                        "Warning: non-existing field '%s' in HarvestSource", key
+                    )
             self.db.commit()
             return source
 
@@ -190,124 +231,45 @@ class HarvesterDBInterface:
             self.db.rollback()
             return None
 
-    def clear_harvest_source(self, source_id):
-        """
-        Clear all datasets related to a harvest source in CKAN, and clean up the
-        harvest_record and harvest_record_error tables.
-        :param source_id: ID of the harvest source to clear
-        """
+    def can_delete_harvest_source(self, source_id):
+        """Return whether a harvest source may be deleted.
 
-        # delete all HarvestRecords and related HarvestRecordErrors
-        def _clear_harvest_records():
-            self.db.query(HarvestRecordError).filter(
-                HarvestRecordError.harvest_record_id.in_(
-                    self.db.query(HarvestRecord.id).filter_by(
-                        harvest_source_id=source_id
-                    )
-                )
-            ).delete(synchronize_session=False)
-            self.db.query(HarvestRecord).filter_by(harvest_source_id=source_id).delete()
-            self.db.commit()
-
+        Returns:
+            tuple[bool, str | None, int]: ``(ok, message, status)``.
+            When ``ok`` is True, ``message`` is None and ``status`` is 200.
+            When ``ok`` is False, ``message`` explains why and ``status`` is
+            404 (missing) or 409 (live records remain; clear first).
+        """
         source = self.db.get(HarvestSource, source_id)
         if source is None:
-            return "Harvest source not found"
+            return False, "Harvest source not found", 404
 
-        organization_id = source.organization_id
-
-        records = (
-            self.db.query(HarvestRecord).filter_by(harvest_source_id=source_id).all()
+        record_count = self.get_latest_harvest_records_by_source_orm(
+            source_id, synced=True, count=True
         )
 
-        if not records:
-            return "Harvest source has no records to clear."
+        if record_count == 0:
+            return True, None, 200
 
-        ckan_ids = [record.ckan_id for record in records if record.ckan_id is not None]
-        error_records = [record for record in records if record.status == "error"]
-        jobs_in_progress = self.get_all_harvest_jobs_by_filter(
-            {"harvest_source_id": source.id, "status": "in_progress"}
+        # ruff: noqa: E501
+        return (
+            False,
+            f"Failed: {record_count} records in the Harvest source, please clear it first.",
+            409,
         )
-
-        # Ensure no jobs are in progress
-        if jobs_in_progress:
-            return (
-                "Error: A harvest job is currently in progress. "
-                "Cannot clear datasets."
-            )
-
-        # Ensure (error_records + ckan_ids) = total records
-        if len(error_records) + len(ckan_ids) != len(records):
-            return (
-                "Error: Not all records are either in an error state "
-                "or have a CKAN ID. Cannot proceed without clearing the dataset."
-            )
-
-        if not ckan_ids:
-            _clear_harvest_records()
-            return "Harvest source cleared successfully."
-
-        ckan = RemoteCKAN(os.getenv("CKAN_API_URL"), apikey=os.getenv("CKAN_API_TOKEN"))
-
-        result = ckan.action.package_search(fq=f"harvest_source_id:{source_id}")
-        ckan_datasets = result["count"]
-        start = datetime.now(timezone.utc)
-        retry_count = 0
-        retry_max = 20
-
-        # Retry loop to handle timeouts from cloud.gov and CKAN's Solr backend,
-        # ensuring datasets are cleared despite possible interruptions.
-        while ckan_datasets > 0 and retry_count < retry_max:
-            result = ckan.action.package_search(fq=f"harvest_source_id:{source_id}")
-            ckan_datasets = result["count"]
-            logger.info(
-                f"Attempt {retry_count + 1}: "
-                f"{ckan_datasets} datasets remaining in CKAN"
-            )
-            try:
-                ckan.action.bulk_update_delete(
-                    datasets=ckan_ids, org_id=organization_id
-                )
-            except ckanapi.errors.CKANAPIError as api_err:
-                logger.error(f"CKAN API error: {api_err}")
-            except Exception as err:
-                logger.error(f"Error occurred: {err} \n error_type: {type(err)}")
-                return f"Error occurred: {err}"
-
-            retry_count += 1
-            time.sleep(5)
-
-        # If all datasets are deleted from CKAN, clear harvest records
-        if ckan_datasets == 0:
-            logger.info("All datasets cleared from CKAN, clearing harvest records.")
-            _clear_harvest_records()
-            logger.info(f"Total time: {datetime.now(timezone.utc) - start}")
-            return "Harvest source cleared successfully."
-        else:
-            fail_message = (
-                f"Harvest source clearance failed after {retry_count} "
-                f"attempts. {ckan_datasets} datasets still exist in CKAN."
-            )
-            logger.error(fail_message)
-            return fail_message
 
     def delete_harvest_source(self, source_id):
+        ok, message, status = self.can_delete_harvest_source(source_id)
+        if not ok:
+            return message, status
+
         source = self.db.get(HarvestSource, source_id)
-        if source is None:
-            return "Harvest source not found"
-
-        records = (
-            self.db.query(HarvestRecord).filter_by(harvest_source_id=source_id).all()
+        self.db.delete(source)
+        self.db.commit()
+        return (
+            f"Deleted harvest source with ID:{source_id} successfully",
+            200,
         )
-
-        if len(records) == 0:
-            self.db.delete(source)
-            self.db.commit()
-            return "Harvest source deleted successfully"
-        else:
-            return (
-                f"Failed: {len(records)} records in the Harvest source, "
-                "please Clear it first."
-            )
 
     ## HARVEST JOB
     def add_harvest_job(self, job_data):
@@ -318,18 +280,30 @@ class HarvesterDBInterface:
             self.db.refresh(new_job)
             return new_job
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
             return None
 
     def get_harvest_job(self, job_id):
         return self.db.query(HarvestJob).filter_by(id=job_id).first()
 
-    def get_all_harvest_jobs_by_filter(self, filter):
-        harvest_jobs = self.db.query(HarvestJob).filter_by(**filter).all()
-        return [job for job in harvest_jobs or []]
+    def get_orphaned_harvest_jobs(self) -> List[HarvestJob]:
+        """
+        Retrieves all harvest jobs that are in progress and
+        were created more than one day ago.
+        """
+        one_day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        return (
+            self.db.query(HarvestJob)
+            .filter(
+                HarvestJob.status == "in_progress",
+                HarvestJob.date_created <= one_day_ago,
+            )
+            .order_by(HarvestJob.date_created.desc())
+            .all()
+        )
 
-    def get_first_harvest_jobs_by_filter(self, filter):
+    def get_first_harvest_job_by_filter(self, filter):
         harvest_job = (
             self.db.query(HarvestJob)
             .filter_by(**filter)
@@ -338,16 +312,43 @@ class HarvesterDBInterface:
         )
         return harvest_job
 
-    def get_new_harvest_jobs_in_past(self):
+    def get_harvest_jobs_by_source_id(self, source_id):
+        """used by follow-up job helper"""
         harvest_jobs = (
+            self.db.query(HarvestJob)
+            .filter_by(harvest_source_id=source_id)
+            .order_by(HarvestJob.date_created.desc())
+            .limit(2)
+            .all()
+        )
+        return harvest_jobs
+
+    def get_in_progress_jobs(self):
+        """Get harvest jobs that are in progress."""
+        return list(
+            self.db.query(HarvestJob).filter(HarvestJob.status == "in_progress")
+        )
+
+    def get_new_harvest_jobs_in_past(self, limit=None):
+        """Get harvest jobs in the database that need to be run.
+
+        A job that needs to be run has status "new" and a date_created that is
+        before now. The jobs are returned in ascending order of date_created so that the
+        oldest jobs are given first.
+
+        If `limit` is given, it limits the number of returned jobs to at most that
+        number. The default is to return all the jobs.
+        """
+        return (
             self.db.query(HarvestJob)
             .filter(
                 HarvestJob.date_created < datetime.now(timezone.utc),
                 HarvestJob.status == "new",
             )
+            .order_by(asc(HarvestJob.date_created))
+            .limit(limit)
             .all()
         )
-        return [job for job in harvest_jobs]
 
     def get_new_harvest_jobs_by_source_in_future(self, source_id):
         harvest_jobs = (
@@ -361,11 +362,6 @@ class HarvesterDBInterface:
         )
         return [job for job in harvest_jobs or []]
 
-    def get_harvest_jobs_by_faceted_filter(self, attr, values):
-        query_list = [getattr(HarvestJob, attr) == value for value in values]
-        harvest_jobs = self.db.query(HarvestJob).filter(or_(*query_list)).all()
-        return [job for job in harvest_jobs]
-
     def update_harvest_job(self, job_id, updates):
         try:
             job = self.db.get(HarvestJob, job_id)
@@ -374,7 +370,9 @@ class HarvesterDBInterface:
                 if hasattr(job, key):
                     setattr(job, key, value)
                 else:
-                    print(f"Warning: non-existing field '{key}' in HarvestJob")
+                    logger.warning(
+                        "Warning: non-existing field '%s' in HarvestJob", key
+                    )
 
             self.db.commit()
             return job
@@ -386,10 +384,10 @@ class HarvesterDBInterface:
     def delete_harvest_job(self, job_id):
         job = self.db.get(HarvestJob, job_id)
         if job is None:
-            return "Harvest job not found"
+            return f"Harvest job {job_id} not found"
         self.db.delete(job)
         self.db.commit()
-        return "Harvest job deleted successfully"
+        return "Harvest job deleted successfully", 200
 
     ## HARVEST ERROR
     def add_harvest_job_error(self, error_data: dict):
@@ -400,7 +398,7 @@ class HarvesterDBInterface:
             self.db.refresh(new_error)
             return new_error
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
             return None
 
@@ -412,27 +410,185 @@ class HarvesterDBInterface:
             self.db.refresh(new_error)
             return new_error
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
             return None
 
-    def get_harvest_job_errors_by_job(self, job_id: str) -> list[dict]:
+    def get_harvest_job_errors_by_job(self, job_id: str) -> list[HarvestJobError]:
         job = self.get_harvest_job(job_id)
         return [error for error in job.errors or []]
 
+    def get_harvest_record_errors_by_job_for_view(
+        self, job_id: str, severity=None, **kwargs
+    ):
+        """
+        groups validation messages based on harvest record id. aggregates the error
+        messages into a comma-separated string. for all other fields, the 1st row in
+        the group is used.
+
+        This path is used by the harvest job detail page. Keep the expensive grouping
+        work on harvest_record_error, page those grouped results, then join
+        harvest_record only for the displayed rows.
+
+        severity defaults to None to include all issues (errors and warnings).
+        Pass severity="error" or severity="warning" to narrow the returned rows.
+        """
+        error_types = ["ValidationException", "ValidationError"]
+        base = self.db.query(
+            HarvestRecordError.harvest_record_id.label("harvest_record_id"),
+            HarvestRecordError.harvest_job_id.label("harvest_job_id"),
+            HarvestRecordError.date_created.label("date_created"),
+            HarvestRecordError.type.label("type"),
+            HarvestRecordError.severity.label("severity"),
+            HarvestRecordError.message.label("message"),
+            HarvestRecordError.id.label("id"),
+        ).filter(HarvestRecordError.harvest_job_id == job_id)
+        if severity is not None:
+            base = base.filter(HarvestRecordError.severity == severity)
+        base = base.subquery()
+
+        # aggregate the validation messages by harvest_record_id using 1st row for
+        # all other fields. sql indexing starts at 1
+        instance_idx = 1
+        agg = (
+            self.db.query(
+                func.array_agg(base.c.harvest_record_id)[instance_idx].label(
+                    "harvest_record_id"
+                ),
+                func.array_agg(base.c.harvest_job_id)[instance_idx].label(
+                    "harvest_job_id"
+                ),
+                func.array_agg(base.c.date_created)[instance_idx].label("date_created"),
+                func.array_agg(base.c.type)[instance_idx].label("type"),
+                func.array_agg(base.c.severity)[instance_idx].label("severity"),
+                func.array_to_string(func.array_agg(base.c.message), "::").label(
+                    "message"
+                ),
+                func.array_agg(base.c.id)[instance_idx].label("id"),
+            )
+            .filter(base.c.type.in_(error_types))
+            .group_by(base.c.harvest_record_id)
+        )
+
+        # get all other messages as-is and combine
+        other = self.db.query(
+            base.c.harvest_record_id,
+            base.c.harvest_job_id,
+            base.c.date_created,
+            base.c.type,
+            base.c.severity,
+            base.c.message,
+            base.c.id,
+        ).filter(base.c.type.not_in(error_types))
+
+        grouped = agg.union_all(other).subquery()
+        if kwargs.get("count") is True:
+            return self.db.query(grouped.c.harvest_record_id)
+
+        per_page = kwargs.get("per_page") or PAGINATE_ENTRIES_PER_PAGE
+        page = kwargs.get("page") or PAGINATE_START_PAGE
+        paged = grouped.select().limit(per_page).offset(page * per_page).subquery()
+
+        return (
+            self.db.query(
+                paged.c.harvest_record_id,
+                paged.c.harvest_job_id,
+                paged.c.date_created,
+                paged.c.type,
+                paged.c.severity,
+                paged.c.message,
+                paged.c.id,
+                HarvestRecord.identifier,
+                func.coalesce(
+                    cast(HarvestRecord.source_transform, Text), HarvestRecord.source_raw
+                ),
+            )
+            .outerjoin(HarvestRecord, HarvestRecord.id == paged.c.harvest_record_id)
+            .all()
+        )
+
     @count
     @paginate
-    def get_harvest_record_errors_by_job(self, job_id: str, **kwargs):
-        subquery = (
-            self.db.query(HarvestRecord.id)
-            .filter(HarvestRecord.status == "error")
-            .filter(HarvestRecord.harvest_job_id == job_id)
-            .subquery()
+    def get_harvest_record_errors_by_job(self, job_id: str, severity=None, **kwargs):
+        """
+        Retrieves harvest record errors for a given job.
+
+        This function fetches all harvest record errors that belong to a specified job,
+        and joins them with their harvest record, if one exists.
+        The query returns a tuple containing:
+            - HarvestRecordError object
+            - identifier (retrieved from HarvestRecord, can be None)
+            - source_raw (retrieved from HarvestRecord, containing 'title', can be None)
+
+        Or a tuple containing:
+            - Harvest record error values (not as a HarvestRecordError object)
+            - identifier (retrieved from HarvestRecord, can be None)
+            - source_raw (retrieved from HarvestRecord, containing 'title', can be None)
+
+        severity filters the returned rows. It defaults to None to return all
+        issues (errors and warnings). Pass severity="error" or
+        severity="warning" to narrow the returned rows.
+
+        Returns:
+            Query: A SQLAlchemy Query object that, when executed, yields tuples of:
+                (HarvestRecordError, identifier, source_raw).
+        """
+        query = (
+            self.db.query(
+                HarvestRecordError, HarvestRecord.identifier, HarvestRecord.source_raw
+            )
+            .outerjoin(
+                HarvestRecord, HarvestRecord.id == HarvestRecordError.harvest_record_id
+            )
+            .filter(HarvestRecordError.harvest_job_id == job_id)
         )
-        query = self.db.query(HarvestRecordError).filter(
-            HarvestRecordError.harvest_record_id.in_(select(subquery))
-        )
+
+        if severity is not None:
+            query = query.filter(HarvestRecordError.severity == severity)
+
+        for_view = kwargs.get("for_view", False)
+        if for_view:
+            return self.get_harvest_record_errors_by_job_for_view(
+                job_id, severity=severity, **kwargs
+            )
+
         return query
+
+    def get_harvest_record_issues(self, job_id: str, **kwargs):
+        """Retrieve all harvest record issues (errors and warnings) for a job.
+
+        This is a convenience wrapper over get_harvest_record_errors_by_job with
+        severity=None. It returns the same tuple shape and honors the same
+        count/pagination kwargs.
+        """
+        return self.get_harvest_record_errors_by_job(job_id, severity=None, **kwargs)
+
+    def stream_harvest_record_errors_by_job(self, job_id: str, batch_size=1000):
+        """
+        Stream record errors for CSV export without OFFSET pagination.
+        """
+        query = text("""
+            SELECT
+                harvest_record_error.id,
+                harvest_record.identifier,
+                CASE
+                    WHEN left(ltrim(harvest_record.source_raw), 1) IN ('{', '[')
+                    THEN harvest_record.source_raw
+                    ELSE NULL
+                END AS source_raw,
+                harvest_record_error.harvest_record_id,
+                harvest_record_error.type,
+                harvest_record_error.severity,
+                harvest_record_error.message,
+                harvest_record_error.date_created
+            FROM harvest_record_error
+            LEFT OUTER JOIN harvest_record
+                ON harvest_record.id = harvest_record_error.harvest_record_id
+            WHERE harvest_record_error.harvest_job_id = :job_id
+        """)
+        return (
+            self.db.execute(query, {"job_id": job_id}).mappings().yield_per(batch_size)
+        )
 
     def get_harvest_error(self, error_id: str) -> dict:
         job_query = self.db.query(HarvestJobError).filter_by(id=error_id).first()
@@ -444,11 +600,35 @@ class HarvesterDBInterface:
         else:
             return None
 
-    def get_harvest_record_errors_by_record(self, record_id: str):
+    def get_harvest_record_errors_by_record(self, record_id: str, severity="error"):
+        """Retrieve harvest record errors for a given record.
+
+        severity defaults to "error" to preserve existing behavior; pass
+        severity=None to return all issues (errors and warnings).
+        """
         errors = self.db.query(HarvestRecordError).filter_by(
             harvest_record_id=record_id
         )
+        if severity is not None:
+            errors = errors.filter_by(severity=severity)
         return [err for err in errors or []]
+
+    def get_record_errors_summary_by_job(self, job_id: str):
+        """Get a summary of all record issues for this job, grouped by severity."""
+        query = (
+            self.db.query(
+                HarvestRecordError.severity,
+                HarvestRecordError.type,
+                func.count(),
+            )
+            .where(HarvestRecordError.harvest_job_id == job_id)
+            .group_by(HarvestRecordError.severity, HarvestRecordError.type)
+            .order_by(HarvestRecordError.severity, HarvestRecordError.type)
+        )
+        return [
+            {"severity": severity, "type": error_type, "count": error_count}
+            for severity, error_type, error_count in query
+        ]
 
     ## HARVEST RECORD
     def add_harvest_record(self, record_data):
@@ -459,42 +639,18 @@ class HarvesterDBInterface:
             self.db.refresh(new_record)
             return new_record
         except Exception as e:
-            print("Error:", e)
-            self.db.rollback()
-            return None
-
-    def add_harvest_records(self, records_data: list) -> dict:
-        """
-        Add many records at once
-
-        :param list records_data: List of records with unique UUIDs
-        :return dict id_lookup_table: identifiers -> ids
-        :raises Exception: if the records_data contains records with errors
-        """
-        try:
-            id_lookup_table = {}
-            for i, record_data in enumerate(records_data):
-                new_record = HarvestRecord(id=str(uuid.uuid4()), **record_data)
-                id_lookup_table[new_record.identifier] = new_record.id
-                self.db.add(new_record)
-                if i % 1000 == 0:
-                    self.db.flush()
-            self.db.commit()
-            return id_lookup_table
-        except Exception as e:
-            print("Error:", e)
+            logger.error("Write to db error: %s", e)
             self.db.rollback()
             return None
 
     def update_harvest_record(self, record_id, updates):
         try:
             source = self.db.get(HarvestRecord, record_id)
-
             for key, value in updates.items():
                 if hasattr(source, key):
                     setattr(source, key, value)
                 else:
-                    print(f"Warning: non-existing field '{key}' in HarvestRecord")
+                    logger.error(f"Non-existing field '{key}' in HarvestRecord")
 
             self.db.commit()
             return source
@@ -503,26 +659,404 @@ class HarvesterDBInterface:
             self.db.rollback()
             return None
 
+    def delete_harvest_record(
+        self, identifier=None, record_id=None, harvest_source_id=None
+    ):
+        try:
+            # delete all versions of the record within the given harvest source
+            if harvest_source_id is not None and identifier is not None:
+                records = (
+                    self.db.query(HarvestRecord)
+                    .filter_by(
+                        identifier=identifier, harvest_source_id=harvest_source_id
+                    )
+                    .all()
+                )
+            # delete this exact one (used with cleaning)
+            if record_id is not None:
+                records = self.db.query(HarvestRecord).filter_by(id=record_id).all()
+            if len(records) == 0:
+                logger.warning(
+                    f"Harvest records with identifier {identifier} or {record_id} "
+                    "not found"
+                )
+                return
+            logger.info(
+                f"{len(records)} records with identifier {identifier} or {record_id}\
+                  found in datagov-harvest-db"
+            )
+            for record in records:
+                self.db.delete(record)
+            self.db.commit()
+            return "Harvest record deleted successfully"
+        except:  # noqa E722
+            self.db.rollback()
+            return None
+
     def get_harvest_record(self, record_id):
         return self.db.query(HarvestRecord).filter_by(id=record_id).first()
 
-    def get_latest_harvest_records_by_source(self, source_id):
-        # datetimes are returned as datetime objs not strs
-        sql = text(
-            f"""SELECT * FROM (
-                SELECT DISTINCT ON (identifier) *
-                FROM harvest_record
-                WHERE status = 'success' AND harvest_source_id = '{source_id}'
-                ORDER BY identifier, date_created DESC ) sq
-                WHERE sq.action != 'delete';"""
+    ## DATASETS
+    def _apply_popularity_from_view_count(self, dataset: Optional[Dataset]) -> None:
+        if dataset is None or not dataset.slug:
+            return
+
+        view_count = (
+            self.db.query(DatasetViewCount.view_count)
+            .filter(DatasetViewCount.dataset_slug == dataset.slug)
+            .scalar()
+        )
+        if view_count is None:
+            return
+
+        dataset.popularity = view_count
+
+    def insert_dataset(self, dataset_data: dict):
+        slug = dataset_data.get("slug")
+        if not slug:
+            raise ValueError("dataset_data must include a slug")
+
+        # use a nested transaction so that rollbacks don't rollback
+        # the whole session during the pytests and fail
+        nested = self.db.begin_nested()
+        try:
+            dataset = Dataset(**dataset_data)
+            self.db.add(dataset)
+            self.db.flush()
+            self._apply_popularity_from_view_count(dataset)
+        except Exception as e:
+            nested.rollback()
+            logger.error("Error inserting dataset '%s': %s", slug, e)
+            raise
+        else:
+            nested.commit()
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            self.db.refresh(dataset)
+            return dataset
+
+    def upsert_dataset(self, dataset_data: dict):
+        slug = dataset_data.get("slug")
+        if not slug:
+            raise ValueError("dataset_data must include a slug")
+
+        stmt = insert(Dataset).values(**dataset_data)
+        update_cols = {
+            column: getattr(stmt.excluded, column)
+            for column in dataset_data
+            if column != "slug"
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Dataset.slug],
+            set_=update_cols,
         )
 
-        res = self.db.execute(sql)
+        nested = self.db.begin_nested()
+        dataset = None
+        try:
+            self.db.execute(stmt)
+            self.db.flush()
+            dataset = self.get_dataset_by_slug(slug)
+            self._apply_popularity_from_view_count(dataset)
+        except Exception as e:
+            nested.rollback()
+            logger.error("Error upserting dataset '%s': %s", slug, e)
+            raise
+        else:
+            nested.commit()
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            if dataset is None:
+                dataset = self.get_dataset_by_slug(slug)
+            if dataset is not None:
+                self.db.refresh(dataset)
+            return dataset
 
-        fields = list(res.keys())
-        records = res.fetchall()
+    def delete_dataset_by_slug(self, slug: str) -> bool:
+        """Delete a dataset by slug.
 
-        return [dict(zip(fields, record)) for record in records]
+        Returns True if deleted, False if slug is falsy or dataset not found.
+        On unexpected errors the transaction is rolled back and the exception is raised.
+        """
+        if not slug:
+            return False
+
+        try:
+            dataset = self.get_dataset_by_slug(slug)
+            if dataset is None:
+                return False
+
+            self.db.delete(dataset)
+            self.db.commit()
+            return True
+        except Exception as e:
+            logger.error("Error deleting dataset '%s': %s", slug, e)
+            self.db.rollback()
+            raise
+
+    def get_dataset_by_slug(self, slug: str):
+        if not slug:
+            return None
+        return self.db.query(Dataset).filter_by(slug=slug).first()
+
+    def update_dataset_slug(
+        self, dataset_id: str, new_slug: str
+    ) -> (
+        tuple[Dataset, bool, None] | tuple[Dataset, bool, str] | tuple[None, bool, str]
+    ):
+        """
+        Update the slug of a dataset by its ID.
+
+        Returns a `(dataset, os_synced, error)` 3-tuple so callers have full
+        visibility into what happened at each layer:
+
+        `(dataset, True,  None)`  — DB committed and OpenSearch reindexed.
+        `(dataset, False, str)`   — DB committed; OpenSearch error in `error`.
+        `(None,    False, str)`   — DB commit failed; error message in `error`.
+
+        The two operations are kept in separate try/except blocks so that an
+        OpenSearch failure never rolls back an already-committed slug change.
+        """
+        if not dataset_id or not new_slug:
+            raise ValueError("dataset_id and new_slug are required")
+
+        try:
+            dataset = self.db.get(Dataset, dataset_id)
+            if dataset is None:
+                return None, False, f"Dataset '{dataset_id}' not found."
+            dataset.slug = new_slug
+            self.db.commit()
+            self.db.refresh(dataset)
+        except Exception as e:
+            logger.error("Error updating dataset slug for '%s': %s", dataset_id, e)
+            self.db.rollback()
+            return None, False, str(e)
+
+        try:
+            # imported lazily: database.interface is imported by harvester/__init__.py,
+            # and search.client/search.writer are plain top-level modules, so this
+            # avoids a needless module-level dependency for the one method that uses it.
+            from search.client import OpenSearchClient
+            from search.writer import OpenSearchWriter
+
+            os_client = OpenSearchClient.from_environment()
+            client = OpenSearchWriter(os_client)
+
+            succeeded, failed, errors = client.index_datasets([dataset])
+            if failed or errors:
+                error_msg = f"OpenSearch reindex reported {failed} failure(s): {errors}"
+                logger.error(
+                    "OpenSearch reindex reported failures for dataset '%s': %s",
+                    dataset_id,
+                    errors,
+                )
+                return dataset, False, error_msg
+        except Exception as e:
+            logger.exception(
+                "Exception occurred while reindexing dataset '%s' in OpenSearch",
+                dataset_id,
+            )
+            return dataset, False, str(e)
+
+        return dataset, True, None
+
+    @count
+    @paginate
+    def get_datasets_by_source(self, source_id: str, **kwargs):
+        """
+        Get datasets for a harvest source with optional pagination and counting.
+        """
+        return (
+            self.db.query(Dataset)
+            .filter(Dataset.harvest_source_id == source_id)
+            .order_by(Dataset.last_harvested_date.desc().nullslast())
+        )
+
+    def get_missing_or_outdated_dataset_count_and_sample(self):
+        """
+        calculate the number of missing or outdated datasets. "missing" is when
+        there's a successful harvest record but no dataset. "outdated" is when
+        an older version of a harvest record is used as the dataset when a newer successful
+        one exists
+
+        scoped to record_type == "dataset": other types never get a dataset
+        row, so they'd otherwise show up as permanently "missing".
+
+        context: https://github.com/GSA/data.gov/issues/5883
+        """
+
+        subq = (
+            self.db.query(HarvestRecord)
+            .filter(
+                HarvestRecord.status == "success",
+                HarvestRecord.record_type == "dataset",
+            )
+            .order_by(
+                HarvestRecord.identifier,
+                HarvestRecord.harvest_source_id,
+                desc(HarvestRecord.date_created),
+            )
+            .distinct(
+                HarvestRecord.identifier,
+                HarvestRecord.harvest_source_id,
+            )
+            .subquery()
+        )
+
+        sq = aliased(HarvestRecord, subq)
+
+        missing_record_ids_query = (
+            self.db.query(sq.id)
+            .filter(sq.action != "delete")
+            .filter(~exists().where(Dataset.harvest_record_id == sq.id))
+        )
+
+        # (total missing/outdated count, first 10 records as sample)
+        return (
+            missing_record_ids_query.count(),
+            missing_record_ids_query.limit(10).all(),
+        )
+
+    def get_all_outdated_records(self, days=365, source_id=None):
+        """
+        gets all outdated versions of records older than [days] ago
+        for all harvest sources. "outdated" simply means not the latest
+        or the opposite of 'get_latest_harvest_records_by_source'
+        """
+
+        old_records_query = self.db.query(HarvestRecord).filter(
+            func.extract("days", (func.now() - HarvestRecord.date_created)) > days
+        )
+
+        queries = [HarvestRecord.status == "success"]
+
+        if source_id is not None:
+            queries.append(HarvestRecord.harvest_source_id == source_id)
+
+        subq = (
+            self.db.query(HarvestRecord)
+            .filter(*queries)
+            .order_by(
+                HarvestRecord.identifier,
+                HarvestRecord.harvest_source_id,
+                HarvestRecord.record_type,
+                desc(HarvestRecord.date_created),
+            )
+            .distinct(
+                HarvestRecord.identifier,
+                HarvestRecord.harvest_source_id,
+                HarvestRecord.record_type,
+            )
+            .subquery()
+        )
+
+        sq_alias = aliased(HarvestRecord, subq)
+        latest_successful_records_query = self.db.query(sq_alias).filter(
+            sq_alias.action != "delete"
+        )
+
+        return old_records_query.except_all(latest_successful_records_query).all()
+
+    @count_wrapper
+    @count
+    def get_latest_harvest_records_by_source_orm(
+        self, source_id, include_slug=False, **kwargs
+    ):
+        """Get latest records for each harvest source
+
+        :param string source_id - id for harvest source
+        :param bool synced - only return records with ckan_id
+
+        dedups on (identifier, record_type) so a Dataset and a DataService
+        sharing an identifier don't collide.
+        """
+        # datetimes are returned as datetime objs not strs
+        queries = [
+            HarvestRecord.status == "success",
+            HarvestRecord.harvest_source_id == source_id,
+        ]
+
+        if kwargs.get("count") is True:
+            subq = (
+                self.db.query(
+                    HarvestRecord.identifier,
+                    HarvestRecord.record_type,
+                    HarvestRecord.action,
+                )
+                .filter(*queries)
+                .order_by(
+                    HarvestRecord.identifier,
+                    HarvestRecord.record_type,
+                    desc(HarvestRecord.date_created),
+                )
+                .distinct(HarvestRecord.identifier, HarvestRecord.record_type)
+                .subquery()
+            )
+            return self.db.query(subq.c.identifier).filter(subq.c.action != "delete")
+
+        subq = (
+            self.db.query(HarvestRecord)
+            .filter(*queries)
+            .order_by(
+                HarvestRecord.identifier,
+                HarvestRecord.record_type,
+                desc(HarvestRecord.date_created),
+            )
+            .distinct(HarvestRecord.identifier, HarvestRecord.record_type)
+            .subquery()
+        )
+        sq_alias = aliased(HarvestRecord, subq)
+
+        columns = [
+            sq_alias.identifier,
+            sq_alias.record_type,
+            sq_alias.source_hash,
+            sq_alias.ckan_id,
+            sq_alias.date_created,
+            sq_alias.date_finished,
+            sq_alias.id,
+            sq_alias.action,
+        ]
+
+        query = self.db.query(*columns).filter(sq_alias.action != "delete")
+
+        if include_slug:
+            query = query.add_columns(Dataset.slug.label("dataset_slug")).outerjoin(
+                Dataset,
+                Dataset.harvest_record_id == sq_alias.id,
+            )
+
+        return query
+
+    def get_latest_harvest_records_by_source(self, source_id):
+        return [
+            dict(row._mapping)
+            for row in self.get_latest_harvest_records_by_source_orm(
+                source_id, include_slug=True
+            )
+        ]
+
+    def get_geo_from_string(self, location_name):
+        """get a geometry from the locations table using the location name
+        (e.g. California, New York)"""
+        try:
+            location = (
+                self.db.query(func.ST_AsGeoJSON(Locations.the_geom))
+                .filter(Locations.display_name.ilike(f"%{location_name}%"))
+                .scalar()
+            )
+            return location
+        except Exception as e:
+            logger.error(
+                'Error querying "{}" locations table {}'.format(location_name, e)
+            )
+            return None
 
     def close(self):
         if hasattr(self.db, "remove"):
@@ -549,7 +1083,7 @@ class HarvesterDBInterface:
             self.db.refresh(new_user)
             return True, new_user
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
             return False, "An error occurred while adding the user."
 
@@ -557,7 +1091,7 @@ class HarvesterDBInterface:
         try:
             return self.db.query(HarvestUser).all()
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             return []
 
     def remove_user(self, email):
@@ -569,7 +1103,7 @@ class HarvesterDBInterface:
                 return True
             return False
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             self.db.rollback()
             return False
 
@@ -596,35 +1130,128 @@ class HarvesterDBInterface:
                     return True
             return False
         except Exception as e:
-            print("Error:", e)
+            logger.error("Error: %s", e)
             return False
 
     #### PAGINATED QUERIES ####
     @count
     @paginate
-    def pget_harvest_jobs(self, filter=text(""), **kwargs):
-        return self.db.query(HarvestJob).filter(filter)
+    def pget_db_query(self, model=None, facets="", order_by="asc", **kwargs):
+        model_map = {
+            "organizations": Organization,
+            "harvest_sources": HarvestSource,
+            "harvest_records": HarvestRecord,
+            "harvest_jobs": HarvestJob,
+            "harvest_job_errors": HarvestJobError,
+            "harvest_record_errors": HarvestRecordError,
+        }
+        model_class = model_map.get(model)
+        if model_class is None:
+            return f"Incorrect model arg {model}", 400
 
-    @count
-    @paginate
-    def pget_harvest_records(self, filter=text(""), **kwargs):
-        return self.db.query(HarvestRecord).filter(filter)
+        facet_list = HarvesterDBInterface.query_filter_builder(model_class, facets)
 
-    @count
-    @paginate
-    def pget_harvest_job_errors(self, filter=text(""), **kwargs):
-        return self.db.query(HarvestJobError).filter(filter)
+        # TODO: should we add date_created to these models??
+        if model in ["organizations", "harvest_sources"]:
+            return self.db.query(model_class).filter(*facet_list)
 
-    @count
-    @paginate
-    def pget_harvest_record_errors(self, filter=text(""), **kwargs):
-        return self.db.query(HarvestRecordError).filter(filter)
+        order_by_val = order_by_helper(model_class, order_by)
 
-    #### FACETED BUILDER QUERIES ####
-    def get_harvest_records_by_job(self, job_id, facets=[], **kwargs):
-        filter_string = " AND ".join([f"harvest_job_id = '{job_id}'"] + facets)
-        return self.pget_harvest_records(filter=text(filter_string), **kwargs)
+        return self.db.query(model_class).filter(*facet_list).order_by(order_by_val)
 
-    def get_harvest_records_by_source(self, source_id, facets=[], **kwargs):
-        filter_string = " AND ".join([f"harvest_source_id = '{source_id}'"] + facets)
-        return self.pget_harvest_records(filter=text(filter_string), **kwargs)
+    #### FILTERED BUILDER QUERIES ####
+    def pget_organizations(self, facets="", **kwargs):
+        return self.pget_db_query(model="organizations", facets=facets, **kwargs)
+
+    def pget_harvest_sources(self, facets="", **kwargs):
+        return self.pget_db_query(model="harvest_sources", facets=facets, **kwargs)
+
+    def pget_harvest_records(self, facets="", order_by="asc", **kwargs):
+        return self.pget_db_query(
+            model="harvest_records", facets=facets, order_by=order_by, **kwargs
+        )
+
+    def pget_harvest_jobs(self, facets="", order_by="asc", **kwargs):
+        return self.pget_db_query(
+            model="harvest_jobs", facets=facets, order_by=order_by, **kwargs
+        )
+
+    def pget_harvest_job_errors(self, facets="", order_by="asc", **kwargs):
+        return self.pget_db_query(
+            model="harvest_job_errors", facets=facets, order_by=order_by, **kwargs
+        )
+
+    def pget_harvest_record_errors(
+        self, facets="", order_by="asc", severity="error", **kwargs
+    ):
+        """Paged harvest record errors.
+
+        severity defaults to "error" to preserve existing behavior; pass
+        severity=None to return all issues (errors and warnings).
+        """
+        if severity is not None:
+            severity_facet = f"severity eq {severity}"
+            facets = f"{facets},{severity_facet}" if facets else severity_facet
+        return self.pget_db_query(
+            model="harvest_record_errors", facets=facets, order_by=order_by, **kwargs
+        )
+
+    def get_harvest_records_by_job(self, job_id, facets="", order_by="asc", **kwargs):
+        facet_string = f"harvest_job_id eq {job_id}"
+        if facets:
+            facet_string += "," + facets
+        return self.pget_db_query(
+            model="harvest_records", facets=facet_string, order_by=order_by, **kwargs
+        )
+
+    def get_harvest_records_by_source(
+        self, source_id, facets="", order_by="asc", **kwargs
+    ):
+        facet_string = f"harvest_source_id eq {source_id}"
+        if facets:
+            facet_string += "," + facets
+        return self.pget_db_query(
+            model="harvest_records", facets=facet_string, order_by=order_by, **kwargs
+        )
+
+    def refresh_dataset_mv(self):
+        try:
+            self.db.execute(text("""
+                    DO $$
+                    BEGIN
+                        IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'dataset' AND relkind = 'm') THEN
+                            REFRESH MATERIALIZED VIEW CONCURRENTLY dataset;
+                        END IF;
+                    END $$;
+                """))
+            self.db.commit()
+        except Exception as e:
+            logger.error("Error: %s", e)
+            self.db.rollback()
+
+    def insert_view_counts_of_datasets(self, datasets):
+        """
+        truncates then populates dataset view count table
+
+        used by scripts/update_dataset_view_count.py in monthly github action. data
+        comes from google analytics.
+        """
+
+        try:
+            self.db.execute(text("TRUNCATE TABLE dataset_view_count"))
+
+            # postgres caps query parameters to signed 2**16
+            # going with half (roughly 5000*3)
+            size = 5000
+            while datasets:
+                self.db.execute(insert(DatasetViewCount).values(datasets[:size]))
+                datasets = datasets[size:]
+
+            self.db.commit()
+        except Exception as e:
+            logger.error("Error: %s", e)
+            self.db.rollback()
+
+
+def order_by_helper(model, order_by):
+    return model.date_created.asc() if order_by == "asc" else model.date_created.desc()

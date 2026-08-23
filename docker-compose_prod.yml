@@ -1,3 +1,5 @@
 services:
   app:
-    command: ./harvest-admin-start.sh
+    environment:
+      PORT: ${PORT}
+    command: ./app-start.sh

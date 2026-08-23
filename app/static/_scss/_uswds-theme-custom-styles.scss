@@ -22,30 +22,34 @@ i.e.
 
 @use "uswds-core" as *;
 
-ul.menu {
-  padding-inline-start: 0;
-  li {
-    display: inline-block;
-    &::after {
-      content: '  |'
-    }
-  }
+@import "components/glossary";
+@import "components/icons";
+@import "components/blockview";
+@import "components/progress_bar";
+@import "components/header";
+@import "components/list-tables";
+@import "components/layout";
+
+.word-break-all {
+  word-break: break-all;
 }
 
 .view-buttons {
   button {
-    margin-right: .5rem;
+    margin-right: units(1);
   }
 }
 
 .align-middle {
   vertical-align: middle;
-  top: -1px;
+  top: units("neg-1px");
+
   &.check {
-      color: green;
+    color: color("success");
   }
+
   &.cancel {
-      color: red;
+    color: color("error");
   }
 }
 
@@ -53,12 +57,86 @@ ul.menu {
   text-align: center;
 }
 
-.usa-card__img img {
-  padding: 10px;
-}
-
 .usa-pagination {
   &__item {
     cursor: pointer;
   }
+}
+
+.usa-table-container--scrollable {
+  overflow-x: auto;
+}
+
+.usa-table.usa-table--striped {
+  width: 100%;
+}
+
+// USWDS has no built-in dismissible alert; use grid so the close button
+// stays out of .usa-alert__body > * icon spacing rules.
+.usa-alert.usa-alert--dismissible {
+  align-items: center;
+  display: grid;
+  grid-template-columns: 1fr auto;
+}
+
+.usa-alert.usa-alert--dismissible .usa-alert__body {
+  grid-column: 1;
+  min-width: 0;
+}
+
+.usa-alert.usa-alert--dismissible .usa-alert__close {
+  align-items: center;
+  align-self: center;
+  appearance: none;
+  background-color: transparent;
+  border: 0;
+  color: color("base");
+  cursor: pointer;
+  display: flex;
+  grid-column: 2;
+  margin: 0 units(0.5) 0 0;
+  padding: units(0.5);
+  width: auto;
+
+  &:hover,
+  &:active {
+    background-color: transparent;
+    color: color("ink");
+  }
+
+  &:focus {
+    outline-offset: 0;
+  }
+
+  .usa-icon {
+    height: units(4);
+    width: units(4);
+  }
+}
+
+.config-table {
+  .usa-table {
+    margin-top: 0;
+    margin-bottom: units(2);
+
+    td:first-child {
+      font-weight: font-weight("bold");
+      white-space: nowrap;
+      padding-right: units(3);
+      vertical-align: top;
+      width: 1%;
+    }
+  }
+}
+
+a {
+  text-decoration: none !important;
+}
+
+a:hover {
+  text-decoration: underline !important;
+}
+
+button#btn-download {
+  margin-bottom: units(2);
 }

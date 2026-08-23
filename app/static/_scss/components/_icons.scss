@@ -1,0 +1,8 @@
+// Glossary toggle lives in the header's secondary nav as a USWDS unstyled
+// button. Give its leading icon a small, token-based gap so the icon and
+// "Glossary" label read as one control.
+.js-glossary-toggle {
+  align-items: center;
+  display: inline-flex;
+  gap: units(0.5);
+}

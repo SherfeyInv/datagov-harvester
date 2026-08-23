@@ -1,0 +1,24 @@
+import pytest
+from playwright.sync_api import expect
+
+
+@pytest.fixture()
+def page(unauthed_page):
+    unauthed_page.goto("/openapi/docs")
+    yield unauthed_page
+
+
+class TestOpenAPI:
+    def test_swagger(self, page):
+        expect(page.locator("h2.title")).to_have_text("Datagov Harvester 0.1.0 OAS 3.1")
+        expect(page.locator("h3")).to_have_text(
+            [
+                "Harvest Jobs",
+                "Harvest Records",
+                "Harvest Sources",
+                "Organizations",
+                "Validate",
+            ]
+        )
+        expect(page.locator(".opblock-get")).to_have_count(15)
+        expect(page.locator(".json-schema-2020-12")).to_have_count(10)

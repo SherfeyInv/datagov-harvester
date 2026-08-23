@@ -1,7 +1,3 @@
-pytest.xml
-pytest-coverage.txt
-.coverage
-.pytest_cache
 .ruff_cache
 .DS_Store
 __pycache__/
@@ -31,4 +27,25 @@ requirements.txt
 !.vscode/launch.json
 
 # uswds assets
-app/static/assets
+app/static/assets/*
+
+# for our placeholder image
+!app/static/assets/img
+
+#pytest
+.coverage
+.pytest_cache
+pytest-**.xml
+pytest-coverage-**.txt
+pytest_harvest_errors.csv
+
+# Dynamic test fixtures (regenerated before tests)
+tests/fixtures.json
+tests/badges/**
+
+# qa data
+qa_output/
+
+.env
+.env.*
+!.env.sample

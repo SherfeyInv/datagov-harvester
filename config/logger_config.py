@@ -1,5 +1,6 @@
 LOGGING_CONFIG = {
     "version": 1,
+    "disable_existing_loggers": False,
     "formatters": {
         "standard": {
             "format": (
@@ -17,9 +18,19 @@ LOGGING_CONFIG = {
         },
     },
     "loggers": {
+        "harvest_admin": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
         "harvest_runner": {
             "handlers": ["console"],
             "level": "INFO",
+            "propagate": False,
+        },
+        "opensearch": {
+            "level": "WARNING",
+            "propagate": True,
         },
     },
 }
